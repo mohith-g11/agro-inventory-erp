@@ -22,6 +22,20 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
+  // Theme State: Default to 'light' as requested, with localStorage persistence
+  const [theme, setTheme] = useState(() => {
+    return localStorage.getItem('agro_erp_theme') || 'light';
+  });
+
+  useEffect(() => {
+    localStorage.setItem('agro_erp_theme', theme);
+    if (theme === 'dark') {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+  }, [theme]);
+
   // Cross-tab interaction
   const [preSelectedProductId, setPreSelectedProductId] = useState(null);
   const [activeInvoiceModal, setActiveInvoiceModal] = useState(null);
@@ -62,12 +76,11 @@ export default function App() {
   // Called when an invoice is successfully finalized in POS
   const handleInvoiceCreated = (invoice) => {
     setActiveInvoiceModal(invoice);
-    // Reload live database state
     loadData();
   };
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-slate-950 text-slate-100">
+    <div className="flex h-screen w-screen overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
       {/* Sidebar Navigation */}
       <Sidebar 
         activeTab={activeTab} 
@@ -77,16 +90,16 @@ export default function App() {
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col h-full overflow-hidden">
-        <Header />
+        <Header theme={theme} setTheme={setTheme} />
 
-        <main className="flex-1 overflow-y-auto p-6 md:p-8 bg-slate-950">
+        <main className="flex-1 overflow-y-auto p-6 md:p-8 bg-slate-50 dark:bg-slate-950 transition-colors">
           <div className="max-w-7xl mx-auto space-y-6">
             {error && (
-              <div className="p-4 bg-red-950/60 border border-red-500/50 rounded-2xl text-red-200 text-xs flex items-center justify-between">
+              <div className="p-4 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-500/50 rounded-xl text-red-700 dark:text-red-200 text-xs flex items-center justify-between">
                 <span>{error}</span>
                 <button
                   onClick={loadData}
-                  className="bg-red-800 hover:bg-red-700 text-white px-3 py-1.5 rounded-lg text-xs font-semibold"
+                  className="bg-red-700 hover:bg-red-800 text-white px-3 py-1.5 rounded-lg text-xs font-semibold"
                 >
                   Retry Connection
                 </button>
@@ -103,7 +116,7 @@ export default function App() {
               />
             )}
 
-            {/* TAB 2: INVENTORY & CHEMICAL SUBSTITUTES */}
+            {/* TAB 2: STOCK & SUBSTITUTES */}
             {activeTab === 'inventory' && (
               <InventoryTab
                 inventory={inventory}
@@ -112,7 +125,7 @@ export default function App() {
               />
             )}
 
-            {/* TAB 3: GST POS BILLING COUNTER */}
+            {/* TAB 3: BILLING COUNTER (POS) */}
             {activeTab === 'pos' && (
               <PosBillingTab
                 inventory={inventory}
@@ -122,7 +135,7 @@ export default function App() {
               />
             )}
 
-            {/* TAB 4: FARMER KHATA LEDGER */}
+            {/* TAB 4: FARMER KHATA (CREDIT) */}
             {activeTab === 'khata' && (
               <KhataLedgerTab
                 customers={customers}

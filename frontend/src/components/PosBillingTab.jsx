@@ -4,16 +4,10 @@ import {
   User, 
   ShoppingBag, 
   AlertCircle, 
-  Sparkles, 
   Plus, 
   Trash2, 
-  CheckCircle2, 
-  CreditCard, 
-  Wallet, 
-  ShieldCheck, 
   FileCheck,
   Split,
-  ChevronRight,
   Info
 } from 'lucide-react';
 import { fetchFEFOPreview, createInvoice } from '../services/api';
@@ -31,7 +25,7 @@ export default function PosBillingTab({
   const [fefoLoading, setFefoLoading] = useState(false);
   const [fefoError, setFefoError] = useState(null);
 
-  // Cart line items (each item can be backed by multiple batches!)
+  // Cart line items
   const [cartItems, setCartItems] = useState([]);
   
   // Payment Details
@@ -94,10 +88,8 @@ export default function PosBillingTab({
   const handleAddToCart = () => {
     if (!fefoPreview || !fefoPreview.allocations || fefoPreview.allocations.length === 0) return;
 
-    // Check if product is already in cart
     const existingIndex = cartItems.findIndex(item => item.product_id === fefoPreview.product_id);
     if (existingIndex >= 0) {
-      // Replace with new quantity allocation
       const newItems = [...cartItems];
       newItems[existingIndex] = { ...fefoPreview };
       setCartItems(newItems);
@@ -125,7 +117,7 @@ export default function PosBillingTab({
   const cartTotalSgst = cartItems.reduce((acc, item) => acc + item.total_sgst, 0);
   const cartGrandTotal = Math.round((cartSubtotal + cartTotalCgst + cartTotalSgst) * 100) / 100;
 
-  // Calculate GST Slab breakdown across all batch allocations
+  // Calculate GST Slab breakdown
   const gstSlabBreakdown = {
     '0': { taxable: 0, cgst: 0, sgst: 0, total: 0 },
     '5': { taxable: 0, cgst: 0, sgst: 0, total: 0 },
@@ -210,54 +202,43 @@ export default function PosBillingTab({
 
   return (
     <div className="space-y-6">
-      {/* Header with Statutory Licences */}
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="p-1.5 rounded-lg bg-emerald-500/20 text-emerald-400">
-                <Receipt className="w-5 h-5" />
-              </span>
-              <h2 className="text-xl font-bold text-white tracking-tight">
-                GST Point-of-Sale Billing Counter
-              </h2>
-            </div>
-            <p className="text-xs text-slate-400 mt-1">
-              Automated First-Expired, First-Out (FEFO) multi-batch splitting & 50/50 CGST/SGST compliance
-            </p>
-          </div>
-
-          {/* Quick Demo Trigger */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={handleLoadDemoBayer}
-              className="text-xs bg-indigo-600/30 hover:bg-indigo-600/50 text-indigo-200 border border-indigo-500/40 px-3.5 py-2 rounded-xl font-medium transition active:scale-95 flex items-center gap-2 shadow-sm"
-            >
-              <Split className="w-4 h-4 text-indigo-400" />
-              <span>Load 15 units Bayer Confidor (FEFO Multi-Batch Demo)</span>
-            </button>
-          </div>
+      {/* Header Bar */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div>
+          <h2 className="text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
+            Billing Counter (POS)
+          </h2>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            Select farmer, choose items, and generate official GST tax invoice
+          </p>
         </div>
+
+        {/* Demo Button */}
+        <button
+          onClick={handleLoadDemoBayer}
+          className="text-xs bg-indigo-50 dark:bg-indigo-950/40 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 px-3.5 py-2 rounded-lg font-semibold transition active:scale-95 flex items-center gap-2 shadow-sm shrink-0"
+        >
+          <Split className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+          <span>Load 15 units Bayer Confidor (FEFO Multi-Batch Demo)</span>
+        </button>
       </div>
 
       {/* Main Billing Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Left Column: Farmer Selection & Product FEFO Allocator (7 Cols) */}
-        <div className="lg:col-span-7 space-y-6">
+        {/* Left Column: Farmer & Product Selection (7 Cols) */}
+        <div className="lg:col-span-7 space-y-5">
           {/* 1. Farmer Selection Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                <User className="w-4 h-4 text-emerald-400" />
-                Select Farmer (Khata Profile)
-              </label>
-              <span className="text-[11px] text-slate-400">Mysore Agricultural Belt</span>
-            </div>
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
+            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
+              <User className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              Farmer (Khata Account)
+            </label>
 
+            {/* Larger Farmer Select Dropdown */}
             <select
               value={selectedCustomerId}
               onChange={(e) => setSelectedCustomerId(e.target.value)}
-              className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500 transition"
+              className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-emerald-600 transition"
             >
               {customers.map((c) => (
                 <option key={c.customer_id} value={c.customer_id}>
@@ -267,22 +248,22 @@ export default function PosBillingTab({
             </select>
 
             {currentCustomer && (
-              <div className="grid grid-cols-3 gap-3 p-3 bg-slate-950/60 rounded-xl border border-slate-800/80 text-xs">
+              <div className="grid grid-cols-3 gap-3 p-3 bg-slate-50 dark:bg-slate-950/60 rounded-lg text-xs">
                 <div>
-                  <div className="text-slate-400 text-[10px]">Village & Crop:</div>
-                  <div className="font-semibold text-slate-200 mt-0.5">
+                  <div className="text-slate-500">Village & Crop</div>
+                  <div className="font-semibold text-slate-800 dark:text-slate-200 mt-0.5">
                     {currentCustomer.village} • {currentCustomer.primary_crop}
                   </div>
                 </div>
                 <div>
-                  <div className="text-slate-400 text-[10px]">Current Khata Due:</div>
-                  <div className="font-bold text-sky-400 font-mono mt-0.5">
+                  <div className="text-slate-500">Current Due</div>
+                  <div className="font-bold text-sky-700 dark:text-sky-400 mt-0.5">
                     ₹{currentCustomer.total_credit_due?.toFixed(2)}
                   </div>
                 </div>
                 <div>
-                  <div className="text-slate-400 text-[10px]">Available Credit Limit:</div>
-                  <div className="font-bold text-emerald-400 font-mono mt-0.5">
+                  <div className="text-slate-500">Available Limit</div>
+                  <div className="font-bold text-emerald-700 dark:text-emerald-400 mt-0.5">
                     ₹{currentCustomer.available_credit?.toFixed(2)}
                   </div>
                 </div>
@@ -291,71 +272,68 @@ export default function PosBillingTab({
           </div>
 
           {/* 2. Product & Quantity Selector */}
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                <ShoppingBag className="w-4 h-4 text-emerald-400" />
-                Select Product & Billing Quantity
-              </label>
-              <span className="text-[11px] text-emerald-400 font-mono">FEFO Engine Active</span>
-            </div>
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
+              <ShoppingBag className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              Product & Quantity
+            </label>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-              <div className="md:col-span-2">
-                <select
-                  value={selectedProductId}
-                  onChange={(e) => setSelectedProductId(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs text-white focus:outline-none focus:border-emerald-500 transition"
-                >
-                  {inventory.map((p) => (
-                    <option key={p.product_id} value={p.product_id}>
-                      {p.name} ({p.brand}) — Stock: {p.total_stock} {p.base_unit} [GST: {p.gst_slab}%]
-                    </option>
+            {/* Larger Product Select Dropdown */}
+            <select
+              value={selectedProductId}
+              onChange={(e) => setSelectedProductId(e.target.value)}
+              className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-emerald-600 transition"
+            >
+              {inventory.map((p) => (
+                <option key={p.product_id} value={p.product_id}>
+                  {p.name} ({p.brand}) — Stock: {p.total_stock} {p.base_unit} [GST: {p.gst_slab}%]
+                </option>
+              ))}
+            </select>
+
+            {/* Quantity Input and Large Quick Buttons */}
+            <div>
+              <div className="text-xs text-slate-500 mb-1.5 font-medium">Quantity to Bill:</div>
+              <div className="flex items-center gap-3">
+                <input
+                  type="number"
+                  min="1"
+                  step="1"
+                  value={quantity}
+                  onChange={(e) => setQuantity(Math.max(1, parseFloat(e.target.value) || 1))}
+                  className="w-32 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-3 py-2.5 text-base text-slate-900 dark:text-white font-bold text-center focus:outline-none focus:border-emerald-600"
+                />
+                <div className="flex gap-2">
+                  {[1, 5, 10, 15].map(q => (
+                    <button
+                      key={q}
+                      type="button"
+                      onClick={() => setQuantity(q)}
+                      className={`text-sm px-4 py-2.5 rounded-lg font-bold transition ${
+                        quantity === q 
+                          ? 'bg-emerald-600 text-white shadow-sm' 
+                          : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700'
+                      }`}
+                    >
+                      +{q}
+                    </button>
                   ))}
-                </select>
-              </div>
-
-              <div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="number"
-                    min="1"
-                    step="1"
-                    value={quantity}
-                    onChange={(e) => setQuantity(Math.max(1, parseFloat(e.target.value) || 1))}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white font-mono font-bold focus:outline-none focus:border-emerald-500 text-center"
-                  />
-                  <div className="flex gap-1">
-                    {[1, 5, 10, 15].map(q => (
-                      <button
-                        key={q}
-                        type="button"
-                        onClick={() => setQuantity(q)}
-                        className={`text-[10px] px-2 py-1.5 rounded-lg font-mono font-bold transition ${
-                          quantity === q ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                        }`}
-                      >
-                        +{q}
-                      </button>
-                    ))}
-                  </div>
                 </div>
               </div>
             </div>
 
-            {/* LIVE FEFO MULTI-BATCH PREVIEW BOX */}
-            <div className="bg-slate-950/80 rounded-xl p-4 border border-emerald-500/30 space-y-3">
+            {/* Live FEFO Batch Allocation Display */}
+            <div className="bg-slate-50 dark:bg-slate-950/80 rounded-xl p-4 border border-slate-200 dark:border-slate-800 space-y-3">
               <div className="flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2">
-                  <Split className="w-4 h-4 text-emerald-400" />
-                  <span className="font-bold text-white">Live FEFO Batch Allocation Plan:</span>
+                <div className="font-semibold text-slate-700 dark:text-slate-300">
+                  Auto-selected from earliest expiring batch(es):
                 </div>
-                {fefoLoading && <span className="text-[11px] text-slate-400 animate-pulse">Calculating FEFO order...</span>}
+                {fefoLoading && <span className="text-slate-400 animate-pulse">Calculating split...</span>}
               </div>
 
               {fefoError && (
-                <div className="p-3 bg-red-950/40 border border-red-500/40 rounded-lg text-xs text-red-300 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                <div className="p-3 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
                   <span>{fefoError}</span>
                 </div>
               )}
@@ -363,74 +341,50 @@ export default function PosBillingTab({
               {fefoPreview && (
                 <div className="space-y-3">
                   <div className="space-y-2">
-                    {fefoPreview.allocations.map((alloc, idx) => {
-                      const isNearExpiry = new Date(alloc.expiry_date) - new Date() < 30 * 24 * 3600 * 1000;
-                      return (
-                        <div 
-                          key={alloc.batch_id}
-                          className="flex items-center justify-between p-2.5 bg-slate-900 rounded-lg border border-slate-800 text-xs"
-                        >
-                          <div className="space-y-0.5">
-                            <div className="flex items-center gap-2">
-                              <span className="w-4 h-4 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-bold flex items-center justify-center">
-                                {idx + 1}
-                              </span>
-                              <span className="font-mono font-bold text-emerald-300">
-                                Batch {alloc.batch_number}
-                              </span>
-                              {isNearExpiry && (
-                                <span className="text-[9px] bg-red-500/20 text-red-400 border border-red-500/40 px-1.5 py-0.5 rounded font-bold">
-                                  Expires Soon ({alloc.expiry_date})
-                                </span>
-                              )}
-                              {!isNearExpiry && (
-                                <span className="text-[9px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded font-mono">
-                                  Exp: {alloc.expiry_date}
-                                </span>
-                              )}
-                            </div>
-                            <div className="text-[11px] text-slate-400">
-                              Available in batch: {alloc.stock_in_batch} {fefoPreview.base_unit} • MRP: ₹{alloc.mrp.toFixed(2)}
-                            </div>
+                    {fefoPreview.allocations.map((alloc) => (
+                      <div 
+                        key={alloc.batch_id}
+                        className="flex items-center justify-between p-3 bg-white dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 text-xs shadow-sm"
+                      >
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-slate-900 dark:text-white text-sm">
+                              Batch {alloc.batch_number}
+                            </span>
+                            <span className="text-xs text-slate-500">
+                              (Exp: {alloc.expiry_date})
+                            </span>
                           </div>
-
-                          <div className="text-right">
-                            <div className="font-bold text-white font-mono text-sm">
-                              {alloc.qty_to_deduct_from_batch} {fefoPreview.base_unit}
-                            </div>
-                            <div className="text-[11px] font-mono text-slate-300">
-                              @ ₹{alloc.selling_price.toFixed(2)} = ₹{alloc.taxable_amount.toFixed(2)}
-                            </div>
+                          <div className="text-slate-500 mt-0.5">
+                            Batch stock: {alloc.stock_in_batch} {fefoPreview.base_unit} • Selling: ₹{alloc.selling_price.toFixed(2)}
                           </div>
                         </div>
-                      );
-                    })}
+
+                        <div className="text-right">
+                          <div className="font-extrabold text-slate-900 dark:text-white text-sm">
+                            {alloc.qty_to_deduct_from_batch} {fefoPreview.base_unit}
+                          </div>
+                          <div className="text-slate-500 font-mono">
+                            ₹{alloc.line_total.toFixed(2)} (incl. tax)
+                          </div>
+                        </div>
+                      </div>
+                    ))}
                   </div>
 
-                  {/* Multi-Batch Splitting Info Banner */}
                   {fefoPreview.allocations.length > 1 && (
-                    <div className="p-2.5 bg-indigo-950/40 border border-indigo-500/30 rounded-lg text-xs text-indigo-200 flex items-start gap-2">
-                      <Info className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+                    <div className="p-2.5 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-900 rounded-lg text-xs text-blue-800 dark:text-blue-300 flex items-start gap-2">
+                      <Info className="w-4 h-4 shrink-0 mt-0.5" />
                       <span>
-                        <strong>Multi-Batch FEFO Split:</strong> The requested {fefoPreview.requested_qty} units exceed the oldest batch capacity. The system safely splits the line item across {fefoPreview.allocations.length} batches to exhaust older stock first.
+                        The requested {fefoPreview.requested_qty} units are split across {fefoPreview.allocations.length} batches to sell older stock first.
                       </span>
                     </div>
                   )}
 
-                  {/* Tax & Total Calculation */}
-                  <div className="pt-2 border-t border-slate-800 flex items-center justify-between text-xs">
-                    <div className="text-slate-400">
-                      Taxable: ₹{fefoPreview.subtotal.toFixed(2)} + GST ({fefoPreview.allocations[0]?.gst_rate}%): ₹{(fefoPreview.total_cgst + fefoPreview.total_sgst).toFixed(2)}
-                    </div>
-                    <div className="font-bold text-emerald-400 font-mono text-sm">
-                      Total: ₹{fefoPreview.grand_total.toFixed(2)}
-                    </div>
-                  </div>
-
                   {/* Add to Bill Button */}
                   <button
                     onClick={handleAddToCart}
-                    className="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 rounded-xl font-bold text-xs shadow-lg shadow-emerald-950 transition active:scale-98 flex items-center justify-center gap-2"
+                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-3 rounded-lg font-bold text-sm shadow-sm transition active:scale-98 flex items-center justify-center gap-2"
                   >
                     <Plus className="w-4 h-4" />
                     Add {fefoPreview.allocated_qty} {fefoPreview.base_unit} to Current Bill
@@ -441,55 +395,50 @@ export default function PosBillingTab({
           </div>
         </div>
 
-        {/* Right Column: Invoice Cart, GST Split, & Payment Controls (5 Cols) */}
-        <div className="lg:col-span-5 space-y-6">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 shadow-sm space-y-4">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
-                <Receipt className="w-4 h-4 text-emerald-400" />
-                Current Tax Invoice Cart
+        {/* Right Column: Invoice Cart & Grand Total (5 Cols) */}
+        <div className="lg:col-span-5 space-y-5">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-200 dark:border-slate-800 pb-3">
+              <h3 className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                <Receipt className="w-4 h-4 text-emerald-600" />
+                Current Bill
               </h3>
-              <span className="text-xs text-slate-400 font-mono">
+              <span className="text-xs text-slate-500 font-medium">
                 {cartItems.length} Products
               </span>
             </div>
 
             {/* Cart Items List */}
             {cartItems.length === 0 ? (
-              <div className="py-8 text-center text-slate-500 text-xs">
-                No items added to the bill yet. Select a product and quantity on the left.
+              <div className="py-8 text-center text-slate-400 text-xs">
+                No items added yet. Select a product on the left.
               </div>
             ) : (
-              <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+              <div className="space-y-2.5 max-h-64 overflow-y-auto pr-1">
                 {cartItems.map((item, idx) => (
                   <div 
                     key={item.product_id} 
-                    className="p-3 bg-slate-950/70 border border-slate-800/80 rounded-xl space-y-2 text-xs"
+                    className="p-3 bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 rounded-lg text-xs space-y-1.5"
                   >
-                    <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-start justify-between">
                       <div>
-                        <div className="font-bold text-slate-100">{item.product_name}</div>
-                        <div className="text-[11px] text-slate-400">{item.brand} • GST {item.allocations[0]?.gst_rate}%</div>
+                        <div className="font-bold text-slate-900 dark:text-white">{item.product_name}</div>
+                        <div className="text-slate-500">{item.brand} • GST {item.allocations[0]?.gst_rate}%</div>
                       </div>
                       <button
                         onClick={() => handleRemoveFromCart(idx)}
-                        className="text-slate-500 hover:text-red-400 p-1 transition"
+                        className="text-slate-400 hover:text-red-600 p-1 transition"
                         title="Remove item"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
 
-                    {/* Batch breakdown rows */}
-                    <div className="space-y-1 bg-slate-900/60 p-2 rounded-lg font-mono text-[11px]">
+                    <div className="space-y-1 pt-1 border-t border-slate-200 dark:border-slate-800 font-mono text-[11px]">
                       {item.allocations.map((alloc) => (
-                        <div key={alloc.batch_id} className="flex justify-between text-slate-300">
-                          <span>
-                            {alloc.batch_number} ({alloc.qty_to_deduct_from_batch} {item.base_unit})
-                          </span>
-                          <span className="font-semibold text-emerald-400">
-                            ₹{alloc.line_total.toFixed(2)}
-                          </span>
+                        <div key={alloc.batch_id} className="flex justify-between text-slate-600 dark:text-slate-400">
+                          <span>{alloc.batch_number} ({alloc.qty_to_deduct_from_batch} {item.base_unit})</span>
+                          <span className="font-semibold text-slate-900 dark:text-white">₹{alloc.line_total.toFixed(2)}</span>
                         </div>
                       ))}
                     </div>
@@ -498,85 +447,50 @@ export default function PosBillingTab({
               </div>
             )}
 
-            {/* 50/50 Multi-Slab GST Table */}
-            <div className="p-3 bg-slate-950/80 rounded-xl border border-slate-800/80 space-y-2">
-              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex justify-between">
-                <span>Multi-Slab Agro GST Summary (50/50 Split)</span>
-                <span className="font-mono text-emerald-400">Rule 3 Compliant</span>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-[10px] text-left border-collapse">
-                  <thead>
-                    <tr className="border-b border-slate-800 text-slate-500 font-semibold">
-                      <th className="py-1">Slab</th>
-                      <th className="py-1 text-right">Taxable (₹)</th>
-                      <th className="py-1 text-right">CGST (₹)</th>
-                      <th className="py-1 text-right">SGST (₹)</th>
-                      <th className="py-1 text-right">Total Tax (₹)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/40 font-mono">
-                    {['0', '5', '12', '18'].map((slab) => {
-                      const data = gstSlabBreakdown[slab];
-                      return (
-                        <tr key={slab} className="text-slate-300">
-                          <td className="py-1 font-semibold text-emerald-400">{slab}%</td>
-                          <td className="py-1 text-right">{data.taxable.toFixed(2)}</td>
-                          <td className="py-1 text-right">{data.cgst.toFixed(2)}</td>
-                          <td className="py-1 text-right">{data.sgst.toFixed(2)}</td>
-                          <td className="py-1 text-right font-bold text-slate-200">{data.total.toFixed(2)}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* Cart Grand Total Card */}
-            <div className="p-4 bg-emerald-950/20 border border-emerald-500/30 rounded-xl space-y-1">
-              <div className="flex justify-between text-xs text-slate-300">
+            {/* Large Grand Total Box */}
+            <div className="p-4 bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-800 rounded-xl space-y-1">
+              <div className="flex justify-between text-xs text-slate-600 dark:text-slate-400">
                 <span>Taxable Subtotal:</span>
-                <span className="font-mono font-medium">₹{cartSubtotal.toFixed(2)}</span>
+                <span className="font-mono">₹{cartSubtotal.toFixed(2)}</span>
               </div>
-              <div className="flex justify-between text-xs text-slate-300">
+              <div className="flex justify-between text-xs text-slate-600 dark:text-slate-400">
                 <span>Total Tax (CGST + SGST):</span>
-                <span className="font-mono font-medium">₹{(cartTotalCgst + cartTotalSgst).toFixed(2)}</span>
+                <span className="font-mono">₹{(cartTotalCgst + cartTotalSgst).toFixed(2)}</span>
               </div>
-              <div className="flex justify-between text-base font-extrabold text-white pt-2 border-t border-emerald-500/20">
-                <span>Invoice Grand Total:</span>
-                <span className="font-mono text-emerald-400 text-lg">₹{cartGrandTotal.toFixed(2)}</span>
+              <div className="flex justify-between items-baseline pt-2 border-t border-emerald-200 dark:border-emerald-800">
+                <span className="font-bold text-slate-900 dark:text-white text-sm">Grand Total:</span>
+                <span className="font-extrabold text-2xl text-emerald-700 dark:text-emerald-400 font-mono">
+                  ₹{cartGrandTotal.toFixed(2)}
+                </span>
               </div>
             </div>
 
             {/* Payment Mode Selector */}
-            <div className="space-y-3 pt-2">
-              <label className="text-xs font-bold text-white uppercase tracking-wider block">
-                Payment Mode & Settlement
+            <div className="space-y-2.5 pt-1">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider block">
+                Payment Mode
               </label>
 
               <div className="grid grid-cols-2 gap-2">
                 {[
-                  { id: 'Cash', label: 'Cash (Paid Full)', icon: Wallet },
-                  { id: 'UPI', label: 'UPI QR (Paid Full)', icon: CreditCard },
-                  { id: 'Credit_Khata', label: 'Farmer Khata (Credit)', icon: User },
-                  { id: 'Partial_Credit', label: 'Partial Khata + Cash', icon: Split },
+                  { id: 'Cash', label: 'Cash' },
+                  { id: 'UPI', label: 'UPI / QR' },
+                  { id: 'Credit_Khata', label: 'Farmer Khata' },
+                  { id: 'Partial_Credit', label: 'Partial Khata' },
                 ].map((mode) => {
-                  const Icon = mode.icon;
                   const isSelected = paymentMode === mode.id;
                   return (
                     <button
                       key={mode.id}
                       type="button"
                       onClick={() => setPaymentMode(mode.id)}
-                      className={`p-2.5 rounded-xl border text-left text-xs transition flex items-center gap-2 ${
+                      className={`p-2.5 rounded-lg border text-center text-xs font-semibold transition ${
                         isSelected
-                          ? 'bg-emerald-600/20 border-emerald-500 text-white font-semibold'
-                          : 'bg-slate-950/60 border-slate-800 text-slate-400 hover:text-slate-200'
+                          ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
+                          : 'bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
                       }`}
                     >
-                      <Icon className={`w-4 h-4 ${isSelected ? 'text-emerald-400' : 'text-slate-500'}`} />
-                      <span>{mode.label}</span>
+                      {mode.label}
                     </button>
                   );
                 })}
@@ -584,46 +498,44 @@ export default function PosBillingTab({
 
               {/* Partial Credit Input */}
               {paymentMode === 'Partial_Credit' && (
-                <div className="p-3 bg-slate-950 rounded-xl border border-slate-800 space-y-2 text-xs">
-                  <label className="text-slate-300 font-medium">Upfront Cash / UPI Paid (₹):</label>
+                <div className="p-3 bg-slate-50 dark:bg-slate-950 rounded-lg border border-slate-200 dark:border-slate-800 space-y-2 text-xs">
+                  <label className="text-slate-700 dark:text-slate-300 font-medium">Upfront Cash / UPI Paid (₹):</label>
                   <input
                     type="number"
                     min="0"
                     max={cartGrandTotal}
                     step="10"
-                    placeholder="Enter upfront amount paid"
+                    placeholder="Enter amount paid"
                     value={cashAmountPaid}
                     onChange={(e) => setCashAmountPaid(e.target.value)}
-                    className="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-white font-mono font-bold focus:outline-none focus:border-emerald-500"
+                    className="w-full bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded p-2 text-slate-900 dark:text-white font-mono font-bold"
                   />
-                  <div className="flex justify-between text-slate-400 pt-1">
-                    <span>Balance added to Farmer Khata:</span>
-                    <span className="font-mono font-bold text-sky-400">₹{balanceToKhata.toFixed(2)}</span>
+                  <div className="flex justify-between text-slate-500 pt-1">
+                    <span>Balance added to Khata:</span>
+                    <span className="font-mono font-bold text-sky-700 dark:text-sky-400">₹{balanceToKhata.toFixed(2)}</span>
                   </div>
                 </div>
               )}
 
               {/* Credit Status Warning if adding to Khata */}
               {balanceToKhata > 0 && currentCustomer && (
-                <div className={`p-3 rounded-xl border text-xs space-y-1 ${
+                <div className={`p-2.5 rounded-lg border text-xs ${
                   isCreditExceeded 
-                    ? 'bg-red-950/40 border-red-500/50 text-red-300' 
-                    : 'bg-sky-950/40 border-sky-500/30 text-sky-200'
+                    ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300' 
+                    : 'bg-sky-50 dark:bg-sky-950/40 border-sky-200 dark:border-sky-800 text-sky-800 dark:text-sky-300'
                 }`}>
-                  <div className="font-bold flex items-center gap-1.5">
-                    {isCreditExceeded ? <AlertCircle className="w-4 h-4 text-red-400" /> : <ShieldCheck className="w-4 h-4 text-sky-400" />}
-                    <span>{isCreditExceeded ? 'Credit Limit Exceeded!' : 'Khata Credit Assessment'}</span>
+                  <div className="font-bold">
+                    {isCreditExceeded ? 'Credit Limit Exceeded!' : 'Adding to Farmer Khata'}
                   </div>
-                  <div className="text-[11px] leading-relaxed">
-                    Adding ₹{balanceToKhata.toFixed(2)} to {currentCustomer.farmer_name}'s Khata.
-                    New balance will be <strong>₹{newProjectedKhataDue.toFixed(2)}</strong> / Limit: ₹{currentCustomer.credit_limit.toFixed(2)}.
+                  <div className="mt-0.5">
+                    Adding ₹{balanceToKhata.toFixed(2)}. New balance will be <strong>₹{newProjectedKhataDue.toFixed(2)}</strong> / Limit: ₹{currentCustomer.credit_limit.toFixed(2)}.
                   </div>
                 </div>
               )}
 
               {errorMessage && (
-                <div className="p-3 bg-red-950/40 border border-red-500/40 rounded-xl text-xs text-red-300 flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                <div className="p-2.5 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg text-xs text-red-700 dark:text-red-300 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 shrink-0" />
                   <span>{errorMessage}</span>
                 </div>
               )}
@@ -632,18 +544,18 @@ export default function PosBillingTab({
               <button
                 disabled={isSubmitting || cartItems.length === 0 || isCreditExceeded}
                 onClick={handleFinalizeBill}
-                className={`w-full py-3 rounded-xl font-bold text-xs uppercase tracking-wider shadow-xl transition active:scale-98 flex items-center justify-center gap-2 ${
+                className={`w-full py-3.5 rounded-lg font-bold text-sm shadow-sm transition active:scale-98 flex items-center justify-center gap-2 ${
                   isSubmitting || cartItems.length === 0 || isCreditExceeded
-                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700/60'
-                    : 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white shadow-emerald-950'
+                    ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 cursor-not-allowed'
+                    : 'bg-emerald-600 hover:bg-emerald-700 text-white'
                 }`}
               >
                 {isSubmitting ? (
-                  <span>Executing ACID Checkout...</span>
+                  <span>Generating Invoice...</span>
                 ) : (
                   <>
                     <FileCheck className="w-4 h-4" />
-                    <span>Finalize & Generate GST Tax Invoice</span>
+                    <span>Finalize & Print GST Bill</span>
                   </>
                 )}
               </button>
