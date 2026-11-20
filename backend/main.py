@@ -3,14 +3,17 @@ Sri Mathurshree Agro Kendra - FastAPI Backend
 Implements Phase 1 Retail & Inventory ERP REST APIs.
 """
 
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import sqlite3
 import datetime
+import re
 from pathlib import Path
-from .database import get_db, init_db
+from database import get_db, init_db
 
 app = FastAPI(
     title="Sri Mathurshree Agro Kendra ERP API",
@@ -27,6 +30,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(RequestValidationError)
+def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """
+    Ensure all validation errors return clean, readable HTTP 400 responses.
+    """
+    error_messages = []
+    for err in exc.errors():
+        field = " -> ".join(str(loc) for loc in err.get("loc", []))
+        msg = err.get("msg", "Invalid value")
+        error_messages.append(f"{field}: {msg}")
+    return JSONResponse(
+        status_code=400,
+        content={"detail": "Validation error: " + "; ".join(error_messages)}
+    )
+
 @app.on_event("startup")
 def startup_event():
     """Ensure database schema is created and seeded on server startup."""
@@ -35,6 +53,40 @@ def startup_event():
 # -----------------------------------------------------------------------------
 # Data Models
 # -----------------------------------------------------------------------------
+ALLOWED_CATEGORIES = ('Seeds', 'NPK_Fertilizer', 'Bio_Fertilizer', 'Pesticide', 'Insecticide')
+ALLOWED_GST_SLABS = ('0', '5', '12', '18')
+ALLOWED_BASE_UNITS = ('Kg', 'Liter', 'Packet', 'Bottle')
+ALLOWED_BULK_UNITS = ('Bag', 'Quintal', 'Box', 'Drum')
+
+class SupplierCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=150)
+    phone: str = Field(..., min_length=10, max_length=15)
+    gstin: str = Field(..., min_length=15, max_length=15)
+    city: str = Field(..., min_length=2, max_length=100)
+
+class ProductCreate(BaseModel):
+    name: str = Field(..., min_length=2, max_length=150)
+    brand: str = Field(..., min_length=1, max_length=100)
+    category: str
+    chemical_composition: str = Field(..., min_length=1, max_length=200)
+    hsn_code: str
+    gst_slab: str
+    base_unit: str
+    bulk_unit: str
+    conversion_factor: float = Field(1.0, gt=0)
+    reorder_level: float = Field(10.0, ge=0)
+
+class BatchCreate(BaseModel):
+    product_id: int
+    batch_number: str = Field(..., min_length=1, max_length=60)
+    mfg_date: str
+    expiry_date: str
+    purchase_price: float = Field(..., gt=0)
+    mrp: float = Field(..., gt=0)
+    selling_price: float = Field(..., gt=0)
+    available_qty: Optional[float] = None
+    quantity: Optional[float] = None
+
 class BatchAllocation(BaseModel):
     batch_id: int
     product_name: str
@@ -783,3 +835,330 @@ def list_invoices():
 
     conn.close()
     return invoices
+
+# -----------------------------------------------------------------------------
+# Phase 2 Step 1: Stock Inward & Supplier Management Endpoints
+# -----------------------------------------------------------------------------
+
+# 8. GET /api/suppliers & POST /api/suppliers
+@app.get("/api/suppliers")
+def get_suppliers():
+    """Returns list of registered agro distributors/suppliers."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT supplier_id, name, phone, gstin, city, created_at
+        FROM suppliers
+        ORDER BY name ASC;
+    """)
+    suppliers = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return suppliers
+
+@app.post("/api/suppliers", status_code=201)
+def create_supplier(supplier_data: SupplierCreate):
+    """Registers a new agro supplier/distributor with unique phone and GSTIN."""
+    name = supplier_data.name.strip()
+    phone = supplier_data.phone.strip()
+    gstin = supplier_data.gstin.strip().upper()
+    city = supplier_data.city.strip()
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Supplier name cannot be empty")
+
+    if not re.match(r"^\+?[0-9]{10,15}$", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Must be 10-15 digits.")
+
+    if not re.match(r"^[0-9A-Z]{15}$", gstin):
+        raise HTTPException(status_code=400, detail="Invalid GSTIN format. Must be a 15-character alphanumeric GSTIN.")
+
+    if not city:
+        raise HTTPException(status_code=400, detail="City cannot be empty")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check duplicate phone
+        cursor.execute("SELECT supplier_id FROM suppliers WHERE phone = ?", (phone,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Supplier with phone '{phone}' already exists")
+
+        # Check duplicate GSTIN
+        cursor.execute("SELECT supplier_id FROM suppliers WHERE gstin = ?", (gstin,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Supplier with GSTIN '{gstin}' already exists")
+
+        cursor.execute("""
+            INSERT INTO suppliers (name, phone, gstin, city)
+            VALUES (?, ?, ?, ?);
+        """, (name, phone, gstin, city))
+        supplier_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("SELECT supplier_id, name, phone, gstin, city, created_at FROM suppliers WHERE supplier_id = ?", (supplier_id,))
+        new_supplier = dict(cursor.fetchone())
+        return new_supplier
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 9. GET /api/products & POST /api/products
+@app.get("/api/products")
+def list_products():
+    """Returns list of products from the catalog."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT 
+            product_id,
+            name,
+            brand,
+            category,
+            chemical_composition,
+            hsn_code,
+            gst_slab,
+            base_unit,
+            bulk_unit,
+            conversion_factor,
+            reorder_level,
+            created_at
+        FROM products
+        ORDER BY name ASC;
+    """)
+    products = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return products
+
+@app.post("/api/products", status_code=201)
+def create_product(product_data: ProductCreate):
+    """
+    Adds a new product to the catalog with category, HSN code, GST slab, and unit validation.
+    """
+    name = product_data.name.strip()
+    brand = product_data.brand.strip()
+    category = product_data.category.strip()
+    chemical_comp = product_data.chemical_composition.strip()
+    hsn_code = product_data.hsn_code.strip()
+    gst_slab = str(product_data.gst_slab).strip()
+    base_unit = product_data.base_unit.strip()
+    bulk_unit = product_data.bulk_unit.strip()
+    conversion_factor = float(product_data.conversion_factor)
+    reorder_level = float(product_data.reorder_level)
+
+    if not name:
+        raise HTTPException(status_code=400, detail="Product name cannot be empty")
+    if not brand:
+        raise HTTPException(status_code=400, detail="Brand cannot be empty")
+    if not chemical_comp:
+        raise HTTPException(status_code=400, detail="Chemical composition cannot be empty")
+
+    # Validate category
+    if category not in ALLOWED_CATEGORIES:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid category '{category}'. Allowed categories: {', '.join(ALLOWED_CATEGORIES)}"
+        )
+
+    # Validate GST slab
+    if gst_slab not in ALLOWED_GST_SLABS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid GST slab '{gst_slab}'. Allowed GST slabs: {', '.join(ALLOWED_GST_SLABS)}"
+        )
+
+    # Validate base_unit
+    if base_unit not in ALLOWED_BASE_UNITS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid base unit '{base_unit}'. Allowed base units: {', '.join(ALLOWED_BASE_UNITS)}"
+        )
+
+    # Validate bulk_unit
+    if bulk_unit not in ALLOWED_BULK_UNITS:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid bulk unit '{bulk_unit}'. Allowed bulk units: {', '.join(ALLOWED_BULK_UNITS)}"
+        )
+
+    # Validate HSN code (4 to 15 alphanumeric characters)
+    if not re.match(r"^[0-9A-Za-z]{4,15}$", hsn_code):
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Invalid HSN code '{hsn_code}'. Must be 4 to 15 alphanumeric characters"
+        )
+
+    if conversion_factor <= 0:
+        raise HTTPException(status_code=400, detail="Conversion factor must be greater than 0")
+
+    if reorder_level < 0:
+        raise HTTPException(status_code=400, detail="Reorder level must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            INSERT INTO products 
+            (name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (name, brand, category, chemical_comp, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level))
+        product_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT product_id, name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level, created_at
+            FROM products WHERE product_id = ?;
+        """, (product_id,))
+        new_prod = dict(cursor.fetchone())
+        return new_prod
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 10. POST /api/batches
+@app.post("/api/batches", status_code=201)
+def create_batch(batch_data: BatchCreate):
+    """
+    Adds a new batch to inventory_batches, enforcing:
+    1. expiry_date > mfg_date
+    2. purchase_price <= selling_price <= mrp
+    3. available_qty > 0
+    Returns clean 400 errors on constraint violations.
+    """
+    # 1. Determine and validate available quantity
+    qty = batch_data.available_qty if batch_data.available_qty is not None else batch_data.quantity
+    if qty is None or qty <= 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Available quantity must be greater than 0"
+        )
+
+    # 2. Validate dates
+    try:
+        mfg = datetime.date.fromisoformat(batch_data.mfg_date.strip())
+        exp = datetime.date.fromisoformat(batch_data.expiry_date.strip())
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(
+            status_code=400, 
+            detail="Invalid date format. Expected YYYY-MM-DD"
+        )
+
+    if exp <= mfg:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Expiry date ({batch_data.expiry_date}) must be after manufacturing date ({batch_data.mfg_date})"
+        )
+
+    # 3. Validate prices (purchase_price <= selling_price <= mrp)
+    pp = float(batch_data.purchase_price)
+    sp = float(batch_data.selling_price)
+    mrp = float(batch_data.mrp)
+
+    if pp <= 0 or sp <= 0 or mrp <= 0:
+        raise HTTPException(
+            status_code=400, 
+            detail="Purchase price, selling price, and MRP must be positive numbers greater than 0"
+        )
+
+    if pp > sp:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Purchase price (₹{pp:.2f}) cannot be greater than selling price (₹{sp:.2f})"
+        )
+
+    if sp > mrp:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Selling price (₹{sp:.2f}) cannot exceed MRP (₹{mrp:.2f})"
+        )
+
+    batch_no = batch_data.batch_number.strip()
+    if not batch_no:
+        raise HTTPException(status_code=400, detail="Batch number cannot be empty")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check product existence
+        cursor.execute("SELECT product_id, name FROM products WHERE product_id = ?", (batch_data.product_id,))
+        prod = cursor.fetchone()
+        if not prod:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Product with ID {batch_data.product_id} does not exist"
+            )
+
+        # Check unique constraint (product_id, batch_number)
+        cursor.execute(
+            "SELECT batch_id FROM inventory_batches WHERE product_id = ? AND batch_number = ?", 
+            (batch_data.product_id, batch_no)
+        )
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Batch '{batch_no}' already exists for product '{dict(prod)['name']}'"
+            )
+
+        cursor.execute("""
+            INSERT INTO inventory_batches 
+            (product_id, batch_number, mfg_date, expiry_date, purchase_price, mrp, selling_price, available_qty)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+        """, (
+            batch_data.product_id,
+            batch_no,
+            mfg.isoformat(),
+            exp.isoformat(),
+            round(pp, 2),
+            round(mrp, 2),
+            round(sp, 2),
+            round(qty, 2)
+        ))
+        batch_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT 
+                batch_id,
+                product_id,
+                batch_number,
+                mfg_date,
+                expiry_date,
+                purchase_price,
+                mrp,
+                selling_price,
+                available_qty,
+                CAST((julianday(expiry_date) - julianday('now')) AS INT) AS days_to_expiry,
+                CASE 
+                    WHEN expiry_date < date('now') THEN 1 
+                    ELSE 0 
+                END AS is_expired,
+                CASE 
+                    WHEN expiry_date >= date('now') AND expiry_date <= date('now', '+30 days') THEN 1 
+                    ELSE 0 
+                END AS is_expiring_soon,
+                created_at
+            FROM inventory_batches
+            WHERE batch_id = ?;
+        """, (batch_id,))
+        new_batch = dict(cursor.fetchone())
+        return new_batch
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as ie:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Database constraint violation: {str(ie)}")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()

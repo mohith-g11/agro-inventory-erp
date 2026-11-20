@@ -55,6 +55,18 @@ CREATE TABLE IF NOT EXISTS inventory_batches (
 
 CREATE INDEX IF NOT EXISTS idx_fefo_allocation ON inventory_batches (product_id, expiry_date ASC, available_qty);
 
+CREATE TABLE IF NOT EXISTS suppliers (
+    supplier_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    phone TEXT NOT NULL UNIQUE,
+    gstin TEXT NOT NULL UNIQUE,
+    city TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_supplier_name ON suppliers (name);
+CREATE INDEX IF NOT EXISTS idx_supplier_city ON suppliers (city);
+
 CREATE TABLE IF NOT EXISTS customers_khata (
     customer_id INTEGER PRIMARY KEY AUTOINCREMENT,
     farmer_name TEXT NOT NULL,
@@ -148,11 +160,32 @@ def parse_and_seed_data(conn: sqlite3.Connection):
     conn.commit()
     print("Database successfully initialized and seeded with 10 products, 11 batches, and 5 farmers!")
 
+def seed_suppliers(conn: sqlite3.Connection):
+    """
+    Seeds 3 realistic Mysuru/Karnataka agro distributors if suppliers table is empty.
+    Ensures safe migration without deleting or re-seeding existing distributor data.
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM suppliers")
+    if cursor.fetchone()[0] == 0:
+        seed_distributors = [
+            ("Sri Chamundeshwari Agro Agencies", "9845123456", "29ABCDE1234F1Z5", "Mysuru"),
+            ("Cauvery Krishi Input Distributors", "9448234567", "29FGHIJ5678K1Z3", "Mandya"),
+            ("Karnataka Agro Feeds & Seeds Corp", "9900345678", "29KLMNO9012P1Z1", "Mysuru")
+        ]
+        cursor.executemany(
+            "INSERT INTO suppliers (name, phone, gstin, city) VALUES (?, ?, ?, ?)",
+            seed_distributors
+        )
+        conn.commit()
+        print("Seeded 3 realistic Mysuru/Karnataka agro distributors into suppliers table.")
+
 def init_db():
     conn = get_db()
     conn.executescript(SQLITE_SCHEMA)
     conn.commit()
     parse_and_seed_data(conn)
+    seed_suppliers(conn)
     conn.close()
 
 if __name__ == "__main__":

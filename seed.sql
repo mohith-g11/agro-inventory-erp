@@ -87,3 +87,11 @@ INSERT INTO invoice_items
 VALUES
 (1, 4, 4, 10.00, 360.00, 18.00, 324.00, 324.00, 4248.00),
 (2, 1, 1, 10.00, 140.00, 5.00, 35.00, 35.00, 1470.00);
+
+-- 6. Insert Realistic Mysuru/Karnataka Agro Distributors (Suppliers)
+INSERT INTO suppliers 
+(supplier_id, name, phone, gstin, city) 
+VALUES
+(1, 'Sri Chamundeshwari Agro Agencies', '9845123456', '29ABCDE1234F1Z5', 'Mysuru'),
+(2, 'Cauvery Krishi Input Distributors', '9448234567', '29FGHIJ5678K1Z3', 'Mandya'),
+(3, 'Karnataka Agro Feeds & Seeds Corp', '9900345678', '29KLMNO9012P1Z1', 'Mysuru');

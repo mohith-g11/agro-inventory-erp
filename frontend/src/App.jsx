@@ -122,6 +122,8 @@ export default function App() {
                 inventory={inventory}
                 loading={loading}
                 onNavigateToPOS={handleNavigateToPOS}
+                onRefresh={loadData}
+                onBatchAdded={loadData}
               />
             )}
 

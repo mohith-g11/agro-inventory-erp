@@ -126,3 +126,19 @@ CREATE TABLE invoice_items (
         REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
     CONSTRAINT chk_qty_positive CHECK (qty_billed > 0)
 ) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 6. SUPPLIERS TABLE (DISTRIBUTOR MANAGEMENT & GRN STOCK INWARD)
+-- Tracks authorized agro distributors across Karnataka/Mysuru.
+-- ----------------------------------------------------------------------------
+CREATE TABLE suppliers (
+    supplier_id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(150) NOT NULL,
+    phone VARCHAR(15) NOT NULL UNIQUE,
+    gstin VARCHAR(15) NOT NULL UNIQUE,
+    city VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_supplier_name (name),
+    INDEX idx_supplier_city (city)
+) ENGINE=InnoDB;
