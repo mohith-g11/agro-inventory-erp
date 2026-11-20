@@ -144,6 +144,7 @@ export default function App() {
                 invoices={invoices}
                 loading={loading}
                 onNavigateToPOS={handleNavigateToPOS}
+                onRefresh={loadData}
               />
             )}
           </div>

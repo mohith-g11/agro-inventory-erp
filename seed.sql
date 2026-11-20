@@ -95,3 +95,11 @@ VALUES
 (1, 'Sri Chamundeshwari Agro Agencies', '9845123456', '29ABCDE1234F1Z5', 'Mysuru'),
 (2, 'Cauvery Krishi Input Distributors', '9448234567', '29FGHIJ5678K1Z3', 'Mandya'),
 (3, 'Karnataka Agro Feeds & Seeds Corp', '9900345678', '29KLMNO9012P1Z1', 'Mysuru');
+
+-- 7. Insert Realistic Farmer Khata Repayments
+INSERT INTO khata_payments 
+(payment_id, customer_id, amount, payment_mode, payment_date, remarks) 
+VALUES
+(1, 1, 4000.00, 'UPI', '2026-10-18 11:30:00', 'Post-harvest paddy advance repayment via PhonePe UPI'),
+(2, 2, 2000.00, 'Cash', '2026-10-20 16:45:00', 'Partial cash payment at Kendra counter'),
+(3, 3, 5000.00, 'Bank_Transfer', '2026-10-25 10:15:00', 'NEFT harvest settlement - Cotton crop yield');

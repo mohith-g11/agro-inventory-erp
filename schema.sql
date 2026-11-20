@@ -142,3 +142,22 @@ CREATE TABLE suppliers (
     INDEX idx_supplier_name (name),
     INDEX idx_supplier_city (city)
 ) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 7. KHATA PAYMENTS TABLE (FARMER REPAYMENTS & SETTLEMENTS)
+-- Tracks farmer debt repayments (Cash, UPI, Bank Transfer) linked to customers_khata.
+-- ----------------------------------------------------------------------------
+CREATE TABLE khata_payments (
+    payment_id INT AUTO_INCREMENT PRIMARY KEY,
+    customer_id INT NOT NULL,
+    amount DECIMAL(12, 2) NOT NULL,
+    payment_mode ENUM('Cash', 'UPI', 'Bank_Transfer') NOT NULL,
+    payment_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    remarks VARCHAR(255) NULL,
+
+    CONSTRAINT fk_payment_customer FOREIGN KEY (customer_id)
+        REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT chk_payment_positive CHECK (amount > 0),
+    INDEX idx_payment_customer (customer_id),
+    INDEX idx_payment_date (payment_date)
+) ENGINE=InnoDB;

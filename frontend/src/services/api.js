@@ -98,3 +98,38 @@ export async function createBatch(batchData) {
   }
   return res.json();
 }
+
+export async function createCustomer(customerData) {
+  const res = await fetch(`${API_BASE}/customers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(customerData)
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to register farmer');
+  }
+  return res.json();
+}
+
+export async function recordRepayment(customerId, repaymentData) {
+  const res = await fetch(`${API_BASE}/customers/${customerId}/repay`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(repaymentData)
+  });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to record repayment');
+  }
+  return res.json();
+}
+
+export async function fetchCustomerLedger(customerId) {
+  const res = await fetch(`${API_BASE}/customers/${customerId}/ledger`);
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || 'Failed to fetch customer ledger');
+  }
+  return res.json();
+}

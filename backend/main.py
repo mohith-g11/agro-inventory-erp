@@ -87,6 +87,18 @@ class BatchCreate(BaseModel):
     available_qty: Optional[float] = None
     quantity: Optional[float] = None
 
+class CustomerCreate(BaseModel):
+    farmer_name: str = Field(..., min_length=2, max_length=120)
+    phone: str = Field(..., min_length=10, max_length=15)
+    village: str = Field(..., min_length=2, max_length=100)
+    primary_crop: str = Field(..., min_length=2, max_length=100)
+    credit_limit: float = Field(25000.0, ge=0)
+
+class RepaymentCreate(BaseModel):
+    amount: float = Field(..., gt=0)
+    payment_mode: str = Field(..., pattern="^(Cash|UPI|Bank_Transfer)$")
+    remarks: Optional[str] = Field(None, max_length=255)
+
 class BatchAllocation(BaseModel):
     batch_id: int
     product_name: str
@@ -907,6 +919,285 @@ def create_supplier(supplier_data: SupplierCreate):
     finally:
         conn.close()
 
+# -----------------------------------------------------------------------------
+# Phase 2 Step 2: Farmer Onboarding & Khata Repayments
+# -----------------------------------------------------------------------------
+
+# 11. POST /api/customers
+@app.post("/api/customers", status_code=201)
+def create_customer(customer_data: CustomerCreate):
+    """
+    Registers a new farmer in customers_khata.
+    Enforces unique phone number and non-negative credit limit.
+    Returns clean 400 error if phone already exists.
+    """
+    farmer_name = customer_data.farmer_name.strip()
+    phone = customer_data.phone.strip()
+    village = customer_data.village.strip()
+    primary_crop = customer_data.primary_crop.strip()
+    credit_limit = float(customer_data.credit_limit)
+
+    if not farmer_name:
+        raise HTTPException(status_code=400, detail="Farmer name cannot be empty")
+
+    if not re.match(r"^\+?[0-9]{10,15}$", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Must be 10-15 digits.")
+
+    if not village:
+        raise HTTPException(status_code=400, detail="Village cannot be empty")
+
+    if not primary_crop:
+        raise HTTPException(status_code=400, detail="Primary crop cannot be empty")
+
+    if credit_limit < 0:
+        raise HTTPException(status_code=400, detail="Credit limit must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check duplicate phone
+        cursor.execute("SELECT customer_id FROM customers_khata WHERE phone = ?;", (phone,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Farmer with phone number '{phone}' already exists")
+
+        cursor.execute("""
+            INSERT INTO customers_khata 
+            (farmer_name, phone, village, primary_crop, total_credit_due, credit_limit)
+            VALUES (?, ?, ?, ?, 0.00, ?);
+        """, (farmer_name, phone, village, primary_crop, round(credit_limit, 2)))
+        customer_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+            FROM customers_khata WHERE customer_id = ?;
+        """, (customer_id,))
+        new_customer = dict(cursor.fetchone())
+        new_customer["available_credit"] = new_customer["credit_limit"]
+        new_customer["credit_utilization_pct"] = 0.0
+        return new_customer
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as ie:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Database constraint violation: {str(ie)}")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 12. POST /api/customers/{customer_id}/repay
+@app.post("/api/customers/{customer_id}/repay", status_code=201)
+def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
+    """
+    Executes a farmer Khata debt repayment inside an atomic ACID transaction:
+    1. Validates customer exists and 0 < amount <= total_credit_due
+    2. Inserts repayment record into khata_payments
+    3. Deducts repayment amount from customers_khata.total_credit_due
+    4. Commits transaction and returns receipt details with updated balance
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit
+            FROM customers_khata
+            WHERE customer_id = ?;
+        """, (customer_id,))
+        cust = cursor.fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail=f"Farmer with customer ID {customer_id} not found")
+
+        cust_info = dict(cust)
+        current_due = float(cust_info["total_credit_due"])
+        amount = float(repayment_data.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Repayment amount must be greater than 0")
+
+        if amount > current_due:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Repayment amount (₹{amount:.2f}) cannot exceed current outstanding due (₹{current_due:.2f})"
+            )
+
+        if repayment_data.payment_mode not in ('Cash', 'UPI', 'Bank_Transfer'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid payment mode. Allowed modes: Cash, UPI, Bank_Transfer"
+            )
+
+        remarks = repayment_data.remarks.strip() if repayment_data.remarks else None
+
+        # Insert repayment record
+        cursor.execute("""
+            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks)
+            VALUES (?, ?, ?, datetime('now'), ?);
+        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks))
+        payment_id = cursor.lastrowid
+
+        # Deduct amount from customer credit due
+        new_due = round(current_due - amount, 2)
+        cursor.execute("""
+            UPDATE customers_khata
+            SET total_credit_due = ?
+            WHERE customer_id = ?;
+        """, (new_due, customer_id))
+
+        cursor.execute("""
+            SELECT payment_date FROM khata_payments WHERE payment_id = ?;
+        """, (payment_id,))
+        payment_date = cursor.fetchone()[0]
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "payment_id": payment_id,
+            "receipt_number": f"REC-KHA-{payment_id:04d}",
+            "customer_id": customer_id,
+            "farmer_name": cust_info["farmer_name"],
+            "phone": cust_info["phone"],
+            "village": cust_info["village"],
+            "amount_paid": amount,
+            "payment_mode": repayment_data.payment_mode,
+            "payment_date": payment_date,
+            "remarks": remarks,
+            "previous_due": current_due,
+            "updated_credit_due": new_due,
+            "credit_limit": cust_info["credit_limit"],
+            "available_credit": round(cust_info["credit_limit"] - new_due, 2)
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# 13. GET /api/customers/{customer_id}/ledger
+@app.get("/api/customers/{customer_id}/ledger")
+def get_customer_ledger(customer_id: int):
+    """
+    Returns a unified reverse-chronological statement combining that farmer's
+    invoices (invoices) and debt repayments (khata_payments).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+        FROM customers_khata
+        WHERE customer_id = ?;
+    """, (customer_id,))
+    cust = cursor.fetchone()
+    if not cust:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    cust_dict = dict(cust)
+
+    # Invoices for this customer
+    cursor.execute("""
+        SELECT 
+            invoice_id,
+            invoice_number,
+            invoice_date,
+            subtotal,
+            total_cgst,
+            total_sgst,
+            grand_total,
+            payment_mode,
+            amount_paid,
+            balance_added_to_khata
+        FROM invoices
+        WHERE customer_id = ?
+        ORDER BY invoice_date DESC;
+    """, (customer_id,))
+    invoices = [dict(row) for row in cursor.fetchall()]
+
+    for inv in invoices:
+        cursor.execute("""
+            SELECT ii.item_id, p.name AS product_name, b.batch_number, ii.qty_billed, ii.unit_price, ii.line_total
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN inventory_batches b ON ii.batch_id = b.batch_id
+            WHERE ii.invoice_id = ?;
+        """, (inv["invoice_id"],))
+        inv["items"] = [dict(r) for r in cursor.fetchall()]
+
+    # Repayments for this customer
+    cursor.execute("""
+        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks
+        FROM khata_payments
+        WHERE customer_id = ?
+        ORDER BY payment_date DESC;
+    """, (customer_id,))
+    payments = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    statement = []
+    total_credit_incurred = 0.0
+
+    for inv in invoices:
+        total_credit_incurred += inv["balance_added_to_khata"]
+        statement.append({
+            "entry_id": f"INV-{inv['invoice_id']}",
+            "type": "INVOICE",
+            "date": inv["invoice_date"],
+            "reference": inv["invoice_number"],
+            "description": f"GST Tax Invoice ({inv['payment_mode'].replace('_', ' ')})",
+            "grand_total": inv["grand_total"],
+            "amount_paid": inv["amount_paid"],
+            "debit": inv["balance_added_to_khata"],
+            "credit": 0.0,
+            "payment_mode": inv["payment_mode"],
+            "items": inv["items"],
+            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter"
+        })
+
+    total_repaid = 0.0
+    for pay in payments:
+        total_repaid += pay["amount"]
+        statement.append({
+            "entry_id": f"PAY-{pay['payment_id']}",
+            "type": "REPAYMENT",
+            "date": pay["payment_date"],
+            "reference": f"REC-KHA-{pay['payment_id']:04d}",
+            "description": f"Khata Repayment ({pay['payment_mode'].replace('_', ' ')})" + (f": {pay['remarks']}" if pay["remarks"] else ""),
+            "grand_total": pay["amount"],
+            "amount_paid": pay["amount"],
+            "debit": 0.0,
+            "credit": pay["amount"],
+            "payment_mode": pay["payment_mode"],
+            "items": [],
+            "remarks": pay["remarks"] or "Counter debt repayment"
+        })
+
+    # Sort reverse-chronologically by date
+    statement.sort(key=lambda x: str(x["date"]), reverse=True)
+
+    available_credit = max(0.0, round(cust_dict["credit_limit"] - cust_dict["total_credit_due"], 2))
+
+    return {
+        "customer": cust_dict,
+        "summary": {
+            "total_credit_due": cust_dict["total_credit_due"],
+            "credit_limit": cust_dict["credit_limit"],
+            "available_credit": available_credit,
+            "total_credit_incurred": round(total_credit_incurred, 2),
+            "total_repaid": round(total_repaid, 2),
+            "invoices_count": len(invoices),
+            "payments_count": len(payments)
+        },
+        "statement": statement
+    }
+
 # 9. GET /api/products & POST /api/products
 @app.get("/api/products")
 def list_products():
@@ -1023,6 +1314,285 @@ def create_product(product_data: ProductCreate):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
+
+# -----------------------------------------------------------------------------
+# Phase 2 Step 2: Farmer Onboarding & Khata Repayments
+# -----------------------------------------------------------------------------
+
+# 11. POST /api/customers
+@app.post("/api/customers", status_code=201)
+def create_customer(customer_data: CustomerCreate):
+    """
+    Registers a new farmer in customers_khata.
+    Enforces unique phone number and non-negative credit limit.
+    Returns clean 400 error if phone already exists.
+    """
+    farmer_name = customer_data.farmer_name.strip()
+    phone = customer_data.phone.strip()
+    village = customer_data.village.strip()
+    primary_crop = customer_data.primary_crop.strip()
+    credit_limit = float(customer_data.credit_limit)
+
+    if not farmer_name:
+        raise HTTPException(status_code=400, detail="Farmer name cannot be empty")
+
+    if not re.match(r"^\+?[0-9]{10,15}$", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Must be 10-15 digits.")
+
+    if not village:
+        raise HTTPException(status_code=400, detail="Village cannot be empty")
+
+    if not primary_crop:
+        raise HTTPException(status_code=400, detail="Primary crop cannot be empty")
+
+    if credit_limit < 0:
+        raise HTTPException(status_code=400, detail="Credit limit must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check duplicate phone
+        cursor.execute("SELECT customer_id FROM customers_khata WHERE phone = ?;", (phone,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Farmer with phone number '{phone}' already exists")
+
+        cursor.execute("""
+            INSERT INTO customers_khata 
+            (farmer_name, phone, village, primary_crop, total_credit_due, credit_limit)
+            VALUES (?, ?, ?, ?, 0.00, ?);
+        """, (farmer_name, phone, village, primary_crop, round(credit_limit, 2)))
+        customer_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+            FROM customers_khata WHERE customer_id = ?;
+        """, (customer_id,))
+        new_customer = dict(cursor.fetchone())
+        new_customer["available_credit"] = new_customer["credit_limit"]
+        new_customer["credit_utilization_pct"] = 0.0
+        return new_customer
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as ie:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Database constraint violation: {str(ie)}")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 12. POST /api/customers/{customer_id}/repay
+@app.post("/api/customers/{customer_id}/repay", status_code=201)
+def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
+    """
+    Executes a farmer Khata debt repayment inside an atomic ACID transaction:
+    1. Validates customer exists and 0 < amount <= total_credit_due
+    2. Inserts repayment record into khata_payments
+    3. Deducts repayment amount from customers_khata.total_credit_due
+    4. Commits transaction and returns receipt details with updated balance
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit
+            FROM customers_khata
+            WHERE customer_id = ?;
+        """, (customer_id,))
+        cust = cursor.fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail=f"Farmer with customer ID {customer_id} not found")
+
+        cust_info = dict(cust)
+        current_due = float(cust_info["total_credit_due"])
+        amount = float(repayment_data.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Repayment amount must be greater than 0")
+
+        if amount > current_due:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Repayment amount (₹{amount:.2f}) cannot exceed current outstanding due (₹{current_due:.2f})"
+            )
+
+        if repayment_data.payment_mode not in ('Cash', 'UPI', 'Bank_Transfer'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid payment mode. Allowed modes: Cash, UPI, Bank_Transfer"
+            )
+
+        remarks = repayment_data.remarks.strip() if repayment_data.remarks else None
+
+        # Insert repayment record
+        cursor.execute("""
+            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks)
+            VALUES (?, ?, ?, datetime('now'), ?);
+        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks))
+        payment_id = cursor.lastrowid
+
+        # Deduct amount from customer credit due
+        new_due = round(current_due - amount, 2)
+        cursor.execute("""
+            UPDATE customers_khata
+            SET total_credit_due = ?
+            WHERE customer_id = ?;
+        """, (new_due, customer_id))
+
+        cursor.execute("""
+            SELECT payment_date FROM khata_payments WHERE payment_id = ?;
+        """, (payment_id,))
+        payment_date = cursor.fetchone()[0]
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "payment_id": payment_id,
+            "receipt_number": f"REC-KHA-{payment_id:04d}",
+            "customer_id": customer_id,
+            "farmer_name": cust_info["farmer_name"],
+            "phone": cust_info["phone"],
+            "village": cust_info["village"],
+            "amount_paid": amount,
+            "payment_mode": repayment_data.payment_mode,
+            "payment_date": payment_date,
+            "remarks": remarks,
+            "previous_due": current_due,
+            "updated_credit_due": new_due,
+            "credit_limit": cust_info["credit_limit"],
+            "available_credit": round(cust_info["credit_limit"] - new_due, 2)
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# 13. GET /api/customers/{customer_id}/ledger
+@app.get("/api/customers/{customer_id}/ledger")
+def get_customer_ledger(customer_id: int):
+    """
+    Returns a unified reverse-chronological statement combining that farmer's
+    invoices (invoices) and debt repayments (khata_payments).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+        FROM customers_khata
+        WHERE customer_id = ?;
+    """, (customer_id,))
+    cust = cursor.fetchone()
+    if not cust:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    cust_dict = dict(cust)
+
+    # Invoices for this customer
+    cursor.execute("""
+        SELECT 
+            invoice_id,
+            invoice_number,
+            invoice_date,
+            subtotal,
+            total_cgst,
+            total_sgst,
+            grand_total,
+            payment_mode,
+            amount_paid,
+            balance_added_to_khata
+        FROM invoices
+        WHERE customer_id = ?
+        ORDER BY invoice_date DESC;
+    """, (customer_id,))
+    invoices = [dict(row) for row in cursor.fetchall()]
+
+    for inv in invoices:
+        cursor.execute("""
+            SELECT ii.item_id, p.name AS product_name, b.batch_number, ii.qty_billed, ii.unit_price, ii.line_total
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN inventory_batches b ON ii.batch_id = b.batch_id
+            WHERE ii.invoice_id = ?;
+        """, (inv["invoice_id"],))
+        inv["items"] = [dict(r) for r in cursor.fetchall()]
+
+    # Repayments for this customer
+    cursor.execute("""
+        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks
+        FROM khata_payments
+        WHERE customer_id = ?
+        ORDER BY payment_date DESC;
+    """, (customer_id,))
+    payments = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    statement = []
+    total_credit_incurred = 0.0
+
+    for inv in invoices:
+        total_credit_incurred += inv["balance_added_to_khata"]
+        statement.append({
+            "entry_id": f"INV-{inv['invoice_id']}",
+            "type": "INVOICE",
+            "date": inv["invoice_date"],
+            "reference": inv["invoice_number"],
+            "description": f"GST Tax Invoice ({inv['payment_mode'].replace('_', ' ')})",
+            "grand_total": inv["grand_total"],
+            "amount_paid": inv["amount_paid"],
+            "debit": inv["balance_added_to_khata"],
+            "credit": 0.0,
+            "payment_mode": inv["payment_mode"],
+            "items": inv["items"],
+            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter"
+        })
+
+    total_repaid = 0.0
+    for pay in payments:
+        total_repaid += pay["amount"]
+        statement.append({
+            "entry_id": f"PAY-{pay['payment_id']}",
+            "type": "REPAYMENT",
+            "date": pay["payment_date"],
+            "reference": f"REC-KHA-{pay['payment_id']:04d}",
+            "description": f"Khata Repayment ({pay['payment_mode'].replace('_', ' ')})" + (f": {pay['remarks']}" if pay["remarks"] else ""),
+            "grand_total": pay["amount"],
+            "amount_paid": pay["amount"],
+            "debit": 0.0,
+            "credit": pay["amount"],
+            "payment_mode": pay["payment_mode"],
+            "items": [],
+            "remarks": pay["remarks"] or "Counter debt repayment"
+        })
+
+    # Sort reverse-chronologically by date
+    statement.sort(key=lambda x: str(x["date"]), reverse=True)
+
+    available_credit = max(0.0, round(cust_dict["credit_limit"] - cust_dict["total_credit_due"], 2))
+
+    return {
+        "customer": cust_dict,
+        "summary": {
+            "total_credit_due": cust_dict["total_credit_due"],
+            "credit_limit": cust_dict["credit_limit"],
+            "available_credit": available_credit,
+            "total_credit_incurred": round(total_credit_incurred, 2),
+            "total_repaid": round(total_repaid, 2),
+            "invoices_count": len(invoices),
+            "payments_count": len(payments)
+        },
+        "statement": statement
+    }
 
 # 10. POST /api/batches
 @app.post("/api/batches", status_code=201)
@@ -1162,3 +1732,563 @@ def create_batch(batch_data: BatchCreate):
         raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
+
+
+
+# -----------------------------------------------------------------------------
+# Phase 2 Step 2: Farmer Onboarding & Khata Repayments
+# -----------------------------------------------------------------------------
+
+# 11. POST /api/customers
+@app.post("/api/customers", status_code=201)
+def create_customer(customer_data: CustomerCreate):
+    """
+    Registers a new farmer in customers_khata.
+    Enforces unique phone number and non-negative credit limit.
+    Returns clean 400 error if phone already exists.
+    """
+    farmer_name = customer_data.farmer_name.strip()
+    phone = customer_data.phone.strip()
+    village = customer_data.village.strip()
+    primary_crop = customer_data.primary_crop.strip()
+    credit_limit = float(customer_data.credit_limit)
+
+    if not farmer_name:
+        raise HTTPException(status_code=400, detail="Farmer name cannot be empty")
+
+    if not re.match(r"^\+?[0-9]{10,15}$", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Must be 10-15 digits.")
+
+    if not village:
+        raise HTTPException(status_code=400, detail="Village cannot be empty")
+
+    if not primary_crop:
+        raise HTTPException(status_code=400, detail="Primary crop cannot be empty")
+
+    if credit_limit < 0:
+        raise HTTPException(status_code=400, detail="Credit limit must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check duplicate phone
+        cursor.execute("SELECT customer_id FROM customers_khata WHERE phone = ?;", (phone,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Farmer with phone number '{phone}' already exists")
+
+        cursor.execute("""
+            INSERT INTO customers_khata 
+            (farmer_name, phone, village, primary_crop, total_credit_due, credit_limit)
+            VALUES (?, ?, ?, ?, 0.00, ?);
+        """, (farmer_name, phone, village, primary_crop, round(credit_limit, 2)))
+        customer_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+            FROM customers_khata WHERE customer_id = ?;
+        """, (customer_id,))
+        new_customer = dict(cursor.fetchone())
+        new_customer["available_credit"] = new_customer["credit_limit"]
+        new_customer["credit_utilization_pct"] = 0.0
+        return new_customer
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as ie:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Database constraint violation: {str(ie)}")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 12. POST /api/customers/{customer_id}/repay
+@app.post("/api/customers/{customer_id}/repay", status_code=201)
+def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
+    """
+    Executes a farmer Khata debt repayment inside an atomic ACID transaction:
+    1. Validates customer exists and 0 < amount <= total_credit_due
+    2. Inserts repayment record into khata_payments
+    3. Deducts repayment amount from customers_khata.total_credit_due
+    4. Commits transaction and returns receipt details with updated balance
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit
+            FROM customers_khata
+            WHERE customer_id = ?;
+        """, (customer_id,))
+        cust = cursor.fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail=f"Farmer with customer ID {customer_id} not found")
+
+        cust_info = dict(cust)
+        current_due = float(cust_info["total_credit_due"])
+        amount = float(repayment_data.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Repayment amount must be greater than 0")
+
+        if amount > current_due:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Repayment amount (₹{amount:.2f}) cannot exceed current outstanding due (₹{current_due:.2f})"
+            )
+
+        if repayment_data.payment_mode not in ('Cash', 'UPI', 'Bank_Transfer'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid payment mode. Allowed modes: Cash, UPI, Bank_Transfer"
+            )
+
+        remarks = repayment_data.remarks.strip() if repayment_data.remarks else None
+
+        # Insert repayment record
+        cursor.execute("""
+            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks)
+            VALUES (?, ?, ?, datetime('now'), ?);
+        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks))
+        payment_id = cursor.lastrowid
+
+        # Deduct amount from customer credit due
+        new_due = round(current_due - amount, 2)
+        cursor.execute("""
+            UPDATE customers_khata
+            SET total_credit_due = ?
+            WHERE customer_id = ?;
+        """, (new_due, customer_id))
+
+        cursor.execute("""
+            SELECT payment_date FROM khata_payments WHERE payment_id = ?;
+        """, (payment_id,))
+        payment_date = cursor.fetchone()[0]
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "payment_id": payment_id,
+            "receipt_number": f"REC-KHA-{payment_id:04d}",
+            "customer_id": customer_id,
+            "farmer_name": cust_info["farmer_name"],
+            "phone": cust_info["phone"],
+            "village": cust_info["village"],
+            "amount_paid": amount,
+            "payment_mode": repayment_data.payment_mode,
+            "payment_date": payment_date,
+            "remarks": remarks,
+            "previous_due": current_due,
+            "updated_credit_due": new_due,
+            "credit_limit": cust_info["credit_limit"],
+            "available_credit": round(cust_info["credit_limit"] - new_due, 2)
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# 13. GET /api/customers/{customer_id}/ledger
+@app.get("/api/customers/{customer_id}/ledger")
+def get_customer_ledger(customer_id: int):
+    """
+    Returns a unified reverse-chronological statement combining that farmer's
+    invoices (invoices) and debt repayments (khata_payments).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+        FROM customers_khata
+        WHERE customer_id = ?;
+    """, (customer_id,))
+    cust = cursor.fetchone()
+    if not cust:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    cust_dict = dict(cust)
+
+    # Invoices for this customer
+    cursor.execute("""
+        SELECT 
+            invoice_id,
+            invoice_number,
+            invoice_date,
+            subtotal,
+            total_cgst,
+            total_sgst,
+            grand_total,
+            payment_mode,
+            amount_paid,
+            balance_added_to_khata
+        FROM invoices
+        WHERE customer_id = ?
+        ORDER BY invoice_date DESC;
+    """, (customer_id,))
+    invoices = [dict(row) for row in cursor.fetchall()]
+
+    for inv in invoices:
+        cursor.execute("""
+            SELECT ii.item_id, p.name AS product_name, b.batch_number, ii.qty_billed, ii.unit_price, ii.line_total
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN inventory_batches b ON ii.batch_id = b.batch_id
+            WHERE ii.invoice_id = ?;
+        """, (inv["invoice_id"],))
+        inv["items"] = [dict(r) for r in cursor.fetchall()]
+
+    # Repayments for this customer
+    cursor.execute("""
+        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks
+        FROM khata_payments
+        WHERE customer_id = ?
+        ORDER BY payment_date DESC;
+    """, (customer_id,))
+    payments = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    statement = []
+    total_credit_incurred = 0.0
+
+    for inv in invoices:
+        total_credit_incurred += inv["balance_added_to_khata"]
+        statement.append({
+            "entry_id": f"INV-{inv['invoice_id']}",
+            "type": "INVOICE",
+            "date": inv["invoice_date"],
+            "reference": inv["invoice_number"],
+            "description": f"GST Tax Invoice ({inv['payment_mode'].replace('_', ' ')})",
+            "grand_total": inv["grand_total"],
+            "amount_paid": inv["amount_paid"],
+            "debit": inv["balance_added_to_khata"],
+            "credit": 0.0,
+            "payment_mode": inv["payment_mode"],
+            "items": inv["items"],
+            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter"
+        })
+
+    total_repaid = 0.0
+    for pay in payments:
+        total_repaid += pay["amount"]
+        statement.append({
+            "entry_id": f"PAY-{pay['payment_id']}",
+            "type": "REPAYMENT",
+            "date": pay["payment_date"],
+            "reference": f"REC-KHA-{pay['payment_id']:04d}",
+            "description": f"Khata Repayment ({pay['payment_mode'].replace('_', ' ')})" + (f": {pay['remarks']}" if pay["remarks"] else ""),
+            "grand_total": pay["amount"],
+            "amount_paid": pay["amount"],
+            "debit": 0.0,
+            "credit": pay["amount"],
+            "payment_mode": pay["payment_mode"],
+            "items": [],
+            "remarks": pay["remarks"] or "Counter debt repayment"
+        })
+
+    # Sort reverse-chronologically by date
+    statement.sort(key=lambda x: str(x["date"]), reverse=True)
+
+    available_credit = max(0.0, round(cust_dict["credit_limit"] - cust_dict["total_credit_due"], 2))
+
+    return {
+        "customer": cust_dict,
+        "summary": {
+            "total_credit_due": cust_dict["total_credit_due"],
+            "credit_limit": cust_dict["credit_limit"],
+            "available_credit": available_credit,
+            "total_credit_incurred": round(total_credit_incurred, 2),
+            "total_repaid": round(total_repaid, 2),
+            "invoices_count": len(invoices),
+            "payments_count": len(payments)
+        },
+        "statement": statement
+    }
+
+# -----------------------------------------------------------------------------
+# Phase 2 Step 2: Farmer Onboarding & Khata Repayments
+# -----------------------------------------------------------------------------
+
+# 11. POST /api/customers
+@app.post("/api/customers", status_code=201)
+def create_customer(customer_data: CustomerCreate):
+    """
+    Registers a new farmer in customers_khata.
+    Enforces unique phone number and non-negative credit limit.
+    Returns clean 400 error if phone already exists.
+    """
+    farmer_name = customer_data.farmer_name.strip()
+    phone = customer_data.phone.strip()
+    village = customer_data.village.strip()
+    primary_crop = customer_data.primary_crop.strip()
+    credit_limit = float(customer_data.credit_limit)
+
+    if not farmer_name:
+        raise HTTPException(status_code=400, detail="Farmer name cannot be empty")
+
+    if not re.match(r"^\+?[0-9]{10,15}$", phone):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Must be 10-15 digits.")
+
+    if not village:
+        raise HTTPException(status_code=400, detail="Village cannot be empty")
+
+    if not primary_crop:
+        raise HTTPException(status_code=400, detail="Primary crop cannot be empty")
+
+    if credit_limit < 0:
+        raise HTTPException(status_code=400, detail="Credit limit must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        # Check duplicate phone
+        cursor.execute("SELECT customer_id FROM customers_khata WHERE phone = ?;", (phone,))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail=f"Farmer with phone number '{phone}' already exists")
+
+        cursor.execute("""
+            INSERT INTO customers_khata 
+            (farmer_name, phone, village, primary_crop, total_credit_due, credit_limit)
+            VALUES (?, ?, ?, ?, 0.00, ?);
+        """, (farmer_name, phone, village, primary_crop, round(credit_limit, 2)))
+        customer_id = cursor.lastrowid
+        conn.commit()
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+            FROM customers_khata WHERE customer_id = ?;
+        """, (customer_id,))
+        new_customer = dict(cursor.fetchone())
+        new_customer["available_credit"] = new_customer["credit_limit"]
+        new_customer["credit_utilization_pct"] = 0.0
+        return new_customer
+    except HTTPException:
+        conn.rollback()
+        raise
+    except sqlite3.IntegrityError as ie:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=f"Database constraint violation: {str(ie)}")
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+# 12. POST /api/customers/{customer_id}/repay
+@app.post("/api/customers/{customer_id}/repay", status_code=201)
+def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
+    """
+    Executes a farmer Khata debt repayment inside an atomic ACID transaction:
+    1. Validates customer exists and 0 < amount <= total_credit_due
+    2. Inserts repayment record into khata_payments
+    3. Deducts repayment amount from customers_khata.total_credit_due
+    4. Commits transaction and returns receipt details with updated balance
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit
+            FROM customers_khata
+            WHERE customer_id = ?;
+        """, (customer_id,))
+        cust = cursor.fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail=f"Farmer with customer ID {customer_id} not found")
+
+        cust_info = dict(cust)
+        current_due = float(cust_info["total_credit_due"])
+        amount = float(repayment_data.amount)
+
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Repayment amount must be greater than 0")
+
+        if amount > current_due:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Repayment amount (₹{amount:.2f}) cannot exceed current outstanding due (₹{current_due:.2f})"
+            )
+
+        if repayment_data.payment_mode not in ('Cash', 'UPI', 'Bank_Transfer'):
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid payment mode. Allowed modes: Cash, UPI, Bank_Transfer"
+            )
+
+        remarks = repayment_data.remarks.strip() if repayment_data.remarks else None
+
+        # Insert repayment record
+        cursor.execute("""
+            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks)
+            VALUES (?, ?, ?, datetime('now'), ?);
+        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks))
+        payment_id = cursor.lastrowid
+
+        # Deduct amount from customer credit due
+        new_due = round(current_due - amount, 2)
+        cursor.execute("""
+            UPDATE customers_khata
+            SET total_credit_due = ?
+            WHERE customer_id = ?;
+        """, (new_due, customer_id))
+
+        cursor.execute("""
+            SELECT payment_date FROM khata_payments WHERE payment_id = ?;
+        """, (payment_id,))
+        payment_date = cursor.fetchone()[0]
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "payment_id": payment_id,
+            "receipt_number": f"REC-KHA-{payment_id:04d}",
+            "customer_id": customer_id,
+            "farmer_name": cust_info["farmer_name"],
+            "phone": cust_info["phone"],
+            "village": cust_info["village"],
+            "amount_paid": amount,
+            "payment_mode": repayment_data.payment_mode,
+            "payment_date": payment_date,
+            "remarks": remarks,
+            "previous_due": current_due,
+            "updated_credit_due": new_due,
+            "credit_limit": cust_info["credit_limit"],
+            "available_credit": round(cust_info["credit_limit"] - new_due, 2)
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# 13. GET /api/customers/{customer_id}/ledger
+@app.get("/api/customers/{customer_id}/ledger")
+def get_customer_ledger(customer_id: int):
+    """
+    Returns a unified reverse-chronological statement combining that farmer's
+    invoices (invoices) and debt repayments (khata_payments).
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+        FROM customers_khata
+        WHERE customer_id = ?;
+    """, (customer_id,))
+    cust = cursor.fetchone()
+    if not cust:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    cust_dict = dict(cust)
+
+    # Invoices for this customer
+    cursor.execute("""
+        SELECT 
+            invoice_id,
+            invoice_number,
+            invoice_date,
+            subtotal,
+            total_cgst,
+            total_sgst,
+            grand_total,
+            payment_mode,
+            amount_paid,
+            balance_added_to_khata
+        FROM invoices
+        WHERE customer_id = ?
+        ORDER BY invoice_date DESC;
+    """, (customer_id,))
+    invoices = [dict(row) for row in cursor.fetchall()]
+
+    for inv in invoices:
+        cursor.execute("""
+            SELECT ii.item_id, p.name AS product_name, b.batch_number, ii.qty_billed, ii.unit_price, ii.line_total
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN inventory_batches b ON ii.batch_id = b.batch_id
+            WHERE ii.invoice_id = ?;
+        """, (inv["invoice_id"],))
+        inv["items"] = [dict(r) for r in cursor.fetchall()]
+
+    # Repayments for this customer
+    cursor.execute("""
+        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks
+        FROM khata_payments
+        WHERE customer_id = ?
+        ORDER BY payment_date DESC;
+    """, (customer_id,))
+    payments = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    statement = []
+    total_credit_incurred = 0.0
+
+    for inv in invoices:
+        total_credit_incurred += inv["balance_added_to_khata"]
+        statement.append({
+            "entry_id": f"INV-{inv['invoice_id']}",
+            "type": "INVOICE",
+            "date": inv["invoice_date"],
+            "reference": inv["invoice_number"],
+            "description": f"GST Tax Invoice ({inv['payment_mode'].replace('_', ' ')})",
+            "grand_total": inv["grand_total"],
+            "amount_paid": inv["amount_paid"],
+            "debit": inv["balance_added_to_khata"],
+            "credit": 0.0,
+            "payment_mode": inv["payment_mode"],
+            "items": inv["items"],
+            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter"
+        })
+
+    total_repaid = 0.0
+    for pay in payments:
+        total_repaid += pay["amount"]
+        statement.append({
+            "entry_id": f"PAY-{pay['payment_id']}",
+            "type": "REPAYMENT",
+            "date": pay["payment_date"],
+            "reference": f"REC-KHA-{pay['payment_id']:04d}",
+            "description": f"Khata Repayment ({pay['payment_mode'].replace('_', ' ')})" + (f": {pay['remarks']}" if pay["remarks"] else ""),
+            "grand_total": pay["amount"],
+            "amount_paid": pay["amount"],
+            "debit": 0.0,
+            "credit": pay["amount"],
+            "payment_mode": pay["payment_mode"],
+            "items": [],
+            "remarks": pay["remarks"] or "Counter debt repayment"
+        })
+
+    # Sort reverse-chronologically by date
+    statement.sort(key=lambda x: str(x["date"]), reverse=True)
+
+    available_credit = max(0.0, round(cust_dict["credit_limit"] - cust_dict["total_credit_due"], 2))
+
+    return {
+        "customer": cust_dict,
+        "summary": {
+            "total_credit_due": cust_dict["total_credit_due"],
+            "credit_limit": cust_dict["credit_limit"],
+            "available_credit": available_credit,
+            "total_credit_incurred": round(total_credit_incurred, 2),
+            "total_repaid": round(total_repaid, 2),
+            "invoices_count": len(invoices),
+            "payments_count": len(payments)
+        },
+        "statement": statement
+    }

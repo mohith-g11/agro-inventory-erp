@@ -115,6 +115,19 @@ CREATE TABLE IF NOT EXISTS invoice_items (
     FOREIGN KEY (batch_id) REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
     CHECK (qty_billed > 0)
 );
+
+CREATE TABLE IF NOT EXISTS khata_payments (
+    payment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id INTEGER NOT NULL,
+    amount REAL NOT NULL CHECK(amount > 0),
+    payment_mode TEXT NOT NULL CHECK(payment_mode IN ('Cash', 'UPI', 'Bank_Transfer')),
+    payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    remarks TEXT,
+    FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_payment_customer ON khata_payments (customer_id);
+CREATE INDEX IF NOT EXISTS idx_payment_date ON khata_payments (payment_date);
 """
 
 def get_db():
@@ -180,12 +193,33 @@ def seed_suppliers(conn: sqlite3.Connection):
         conn.commit()
         print("Seeded 3 realistic Mysuru/Karnataka agro distributors into suppliers table.")
 
+def seed_khata_payments(conn: sqlite3.Connection):
+    """
+    Seeds 2-3 realistic repayment records for existing Mysuru farmers if khata_payments table is empty.
+    Ensures safe migration without deleting or modifying existing ledger data.
+    """
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM khata_payments")
+    if cursor.fetchone()[0] == 0:
+        seed_payments = [
+            (1, 4000.00, 'UPI', '2026-10-18 11:30:00', 'Post-harvest paddy advance repayment via PhonePe UPI'),
+            (2, 2000.00, 'Cash', '2026-10-20 16:45:00', 'Partial cash payment at Kendra counter'),
+            (3, 5000.00, 'Bank_Transfer', '2026-10-25 10:15:00', 'NEFT harvest settlement - Cotton crop yield')
+        ]
+        cursor.executemany(
+            "INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks) VALUES (?, ?, ?, ?, ?)",
+            seed_payments
+        )
+        conn.commit()
+        print("Seeded 3 realistic repayment records for Mysuru farmers into khata_payments.")
+
 def init_db():
     conn = get_db()
     conn.executescript(SQLITE_SCHEMA)
     conn.commit()
     parse_and_seed_data(conn)
     seed_suppliers(conn)
+    seed_khata_payments(conn)
     conn.close()
 
 if __name__ == "__main__":
