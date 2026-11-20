@@ -133,3 +133,12 @@ export async function fetchCustomerLedger(customerId) {
   }
   return res.json();
 }
+
+export async function fetchInvoiceById(invoiceId) {
+  const res = await fetch(`${API_BASE}/invoices/${invoiceId}`);
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Failed to fetch invoice #${invoiceId}`);
+  }
+  return res.json();
+}

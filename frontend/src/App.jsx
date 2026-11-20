@@ -5,7 +5,7 @@ import DashboardTab from './components/DashboardTab';
 import InventoryTab from './components/InventoryTab';
 import PosBillingTab from './components/PosBillingTab';
 import KhataLedgerTab from './components/KhataLedgerTab';
-import InvoiceModal from './components/InvoiceModal';
+import PrintableInvoiceModal from './components/PrintableInvoiceModal';
 import { 
   fetchDashboardSummary, 
   fetchInventory, 
@@ -38,7 +38,7 @@ export default function App() {
 
   // Cross-tab interaction
   const [preSelectedProductId, setPreSelectedProductId] = useState(null);
-  const [activeInvoiceModal, setActiveInvoiceModal] = useState(null);
+  const [printableInvoiceId, setPrintableInvoiceId] = useState(null);
 
   // Load all initial ERP data
   const loadData = async () => {
@@ -75,7 +75,8 @@ export default function App() {
 
   // Called when an invoice is successfully finalized in POS
   const handleInvoiceCreated = (invoice) => {
-    setActiveInvoiceModal(invoice);
+    const invId = invoice?.invoice_id || invoice;
+    setPrintableInvoiceId(invId);
     loadData();
   };
 
@@ -145,17 +146,18 @@ export default function App() {
                 loading={loading}
                 onNavigateToPOS={handleNavigateToPOS}
                 onRefresh={loadData}
+                onPrintInvoice={(invoiceId) => setPrintableInvoiceId(invoiceId)}
               />
             )}
           </div>
         </main>
       </div>
 
-      {/* Completed Invoice View / Print Modal */}
-      {activeInvoiceModal && (
-        <InvoiceModal
-          invoice={activeInvoiceModal}
-          onClose={() => setActiveInvoiceModal(null)}
+      {/* Official Printable GST Tax Invoice Modal (A4 & 80mm Thermal) */}
+      {printableInvoiceId && (
+        <PrintableInvoiceModal
+          invoiceId={printableInvoiceId}
+          onClose={() => setPrintableInvoiceId(null)}
         />
       )}
     </div>
