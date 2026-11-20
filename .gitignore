@@ -1,0 +1,5 @@
+
+# Python & Vite build artifacts
+__pycache__/
+*.py[cod]
+frontend/dist/
