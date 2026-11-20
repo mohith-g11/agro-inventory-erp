@@ -20,7 +20,8 @@ import {
   CreditCard,
   Building,
   Printer,
-  Pencil
+  Pencil,
+  MessageCircle
 } from 'lucide-react';
 import { 
   createCustomer, 
@@ -436,6 +437,25 @@ export default function KhataLedgerTab({
                         }`}>
                           ₹{farmer.total_credit_due.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                         </span>
+                        {!isClear && farmer.credit_limit > 0 && (
+                          <div className="w-24 ml-auto mt-1">
+                            <div className="w-full bg-slate-100 dark:bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${
+                                  (farmer.total_credit_due / farmer.credit_limit) >= 1
+                                    ? 'bg-red-600'
+                                    : (farmer.total_credit_due / farmer.credit_limit) >= 0.8
+                                    ? 'bg-amber-500'
+                                    : 'bg-emerald-500'
+                                }`}
+                                style={{ width: `${Math.min(100, Math.round((farmer.total_credit_due / farmer.credit_limit) * 100))}%` }}
+                              />
+                            </div>
+                            <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                              {Math.round((farmer.total_credit_due / farmer.credit_limit) * 100)}% used
+                            </div>
+                          </div>
+                        )}
                       </td>
 
                       <td className="py-3.5 px-4 text-center">
@@ -450,6 +470,22 @@ export default function KhataLedgerTab({
 
                       <td className="py-3.5 px-4 text-center">
                         <div className="flex items-center justify-center gap-1.5">
+                          {/* WhatsApp Reminder Link */}
+                          {!isClear && (
+                            <a
+                              href={`https://wa.me/91${farmer.phone}?text=${encodeURIComponent(
+                                `Namaskara ${farmer.farmer_name} avare, Sri Mathurshree Agro Kendra Mysuru rinda. Nimma khata balance Rs ${farmer.total_credit_due.toFixed(2)}. Dayavittu marupavati madi. Dhanyavadagalu.`
+                              )}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800 px-2 py-1.5 rounded-lg text-xs font-semibold transition inline-flex items-center gap-1"
+                              title="Send WhatsApp Reminder (Kannada/English)"
+                            >
+                              <MessageCircle className="w-3.5 h-3.5 text-emerald-600" />
+                              <span>WhatsApp</span>
+                            </a>
+                          )}
+
                           {/* 1. Record Repayment Button */}
                           <button
                             onClick={() => handleOpenRepayment(farmer)}

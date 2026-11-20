@@ -7,6 +7,9 @@ import PosBillingTab from './components/PosBillingTab';
 import KhataLedgerTab from './components/KhataLedgerTab';
 import PrintableInvoiceModal from './components/PrintableInvoiceModal';
 import LoginScreen from './components/LoginScreen';
+import SalesHistoryTab from './components/SalesHistoryTab';
+import AlertsTab from './components/AlertsTab';
+import ReportsTab from './components/ReportsTab';
 import { 
   fetchDashboardSummary, 
   fetchInventory, 
@@ -217,6 +220,30 @@ export default function App() {
                 onPrintInvoice={(invoiceId) => setPrintableInvoiceId(invoiceId)}
                 currentUser={currentUser}
               />
+            )}
+
+            {/* TAB 5: SALES & RETURNS REGISTER */}
+            {activeTab === 'sales' && (
+              <SalesHistoryTab
+                onPrintInvoice={(invoiceId) => setPrintableInvoiceId(invoiceId)}
+                currentUser={currentUser}
+                onRefreshData={loadData}
+              />
+            )}
+
+            {/* TAB 6: EXPIRY ACTION CENTER & ALERTS */}
+            {activeTab === 'alerts' && (
+              <AlertsTab
+                onNavigateToPOS={handleNavigateToPOS}
+                onNavigateToInventory={() => setActiveTab('inventory')}
+                currentUser={currentUser}
+                onRefreshData={loadData}
+              />
+            )}
+
+            {/* TAB 7: ENTERPRISE REPORTS & GST */}
+            {activeTab === 'reports' && (
+              <ReportsTab currentUser={currentUser} />
             )}
           </div>
         </main>

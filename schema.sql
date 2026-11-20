@@ -23,13 +23,15 @@ CREATE TABLE products (
     base_unit ENUM('Kg', 'Liter', 'Packet', 'Bottle') NOT NULL COMMENT 'Retail billing unit',
     bulk_unit ENUM('Bag', 'Quintal', 'Box', 'Drum') NOT NULL COMMENT 'Wholesale purchase unit',
     conversion_factor DECIMAL(10, 2) NOT NULL DEFAULT 1.00 COMMENT '1 bulk_unit = X base_units (e.g., 1 Bag = 50 Kg)',
-    reorder_level DECIMAL(10, 2) NOT NULL DEFAULT 10.00,
+    reorder_level INT NOT NULL DEFAULT 15,
+    barcode VARCHAR(60) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     
     -- Indexes for fast POS search and chemical substitute lookup
     INDEX idx_product_chemical (chemical_composition),
     INDEX idx_product_category (category),
-    INDEX idx_product_name (name)
+    INDEX idx_product_name (name),
+    INDEX idx_product_barcode (barcode)
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
@@ -46,18 +48,21 @@ CREATE TABLE inventory_batches (
     mrp DECIMAL(10, 2) NOT NULL COMMENT 'Maximum Retail Price printed on batch',
     selling_price DECIMAL(10, 2) NOT NULL COMMENT 'Store retail price per base_unit (excl. GST)',
     available_qty DECIMAL(10, 2) NOT NULL DEFAULT 0.00 COMMENT 'Current stock in base_unit',
+    supplier_id INT NULL,
+    status ENUM('Active', 'Depleted', 'Expired_Written_Off', 'Quarantined') NOT NULL DEFAULT 'Active',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     -- Constraints
     CONSTRAINT fk_batch_product FOREIGN KEY (product_id) 
         REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_batch_supplier FOREIGN KEY (supplier_id)
+        REFERENCES suppliers(supplier_id) ON DELETE SET NULL,
     CONSTRAINT uq_product_batch UNIQUE (product_id, batch_number),
     CONSTRAINT chk_dates CHECK (expiry_date > mfg_date),
     CONSTRAINT chk_prices CHECK (selling_price <= mrp AND purchase_price <= selling_price),
-    CONSTRAINT chk_qty_non_negative CHECK (available_qty >= 0),
-
-    -- Composite index for First-Expired, First-Out (FEFO) query sorting
-    INDEX idx_fefo_allocation (product_id, expiry_date ASC, available_qty)
+    CONSTRAINT chk_stock_non_negative CHECK (available_qty >= 0),
+    INDEX idx_fefo_allocation (product_id, expiry_date ASC, available_qty),
+    INDEX idx_batch_status (status)
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
@@ -86,7 +91,7 @@ CREATE TABLE customers_khata (
 CREATE TABLE invoices (
     invoice_id INT AUTO_INCREMENT PRIMARY KEY,
     invoice_number VARCHAR(30) NOT NULL UNIQUE COMMENT 'Format: SMAK-2026-XXXX',
-    customer_id INT NOT NULL,
+    customer_id INT NULL,
     invoice_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     subtotal DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
     total_cgst DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
@@ -96,11 +101,13 @@ CREATE TABLE invoices (
     amount_paid DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
     balance_added_to_khata DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
     billed_by VARCHAR(150) NULL,
+    status ENUM('Completed', 'Partially_Returned', 'Returned') NOT NULL DEFAULT 'Completed',
 
     CONSTRAINT fk_invoice_customer FOREIGN KEY (customer_id) 
-        REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+        REFERENCES customers_khata(customer_id) ON DELETE SET NULL ON UPDATE CASCADE,
     CONSTRAINT chk_payment_balance CHECK (ROUND(amount_paid + balance_added_to_khata, 2) = ROUND(grand_total, 2)),
-    INDEX idx_invoice_date (invoice_date)
+    INDEX idx_invoice_date (invoice_date),
+    INDEX idx_invoice_status (status)
 ) ENGINE=InnoDB;
 
 -- ----------------------------------------------------------------------------
@@ -175,4 +182,91 @@ CREATE TABLE users (
     role ENUM('Admin', 'Staff') NOT NULL,
     is_active TINYINT(1) DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 9. STOCK ADJUSTMENTS TABLE (EXPIRY ACTION CENTER & LOSS WRITE-OFFS)
+-- Tracks write-offs, damaged stock, audit discrepancies, and returns to supplier.
+-- ----------------------------------------------------------------------------
+CREATE TABLE stock_adjustments (
+    adjustment_id INT AUTO_INCREMENT PRIMARY KEY,
+    batch_id INT NOT NULL,
+    product_id INT NOT NULL,
+    adjustment_type ENUM('Expired_WriteOff', 'Damaged', 'Return_To_Supplier', 'Audit_Increase', 'Audit_Decrease') NOT NULL,
+    quantity_change INT NOT NULL COMMENT 'Negative for loss/write-off, positive for count discovery',
+    cost_impact DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
+    reason VARCHAR(255) NOT NULL,
+    performed_by VARCHAR(150) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_adj_batch FOREIGN KEY (batch_id)
+        REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_adj_product FOREIGN KEY (product_id)
+        REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT chk_qty_change_nonzero CHECK (quantity_change != 0),
+    INDEX idx_stock_adj_product (product_id),
+    INDEX idx_stock_adj_batch (batch_id),
+    INDEX idx_stock_adj_created (created_at)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 10. SALES RETURNS / CREDIT NOTES TABLE (GST COMPLIANT RETURNS)
+-- ----------------------------------------------------------------------------
+CREATE TABLE sales_returns (
+    return_id INT AUTO_INCREMENT PRIMARY KEY,
+    return_number VARCHAR(30) NOT NULL UNIQUE COMMENT 'Format: CN-SMAK-2026-XXXX',
+    invoice_id INT NOT NULL,
+    customer_id INT NULL,
+    refund_mode ENUM('Cash', 'UPI', 'Khata_Credit_Adjustment') NOT NULL,
+    total_refund_amount DECIMAL(12, 2) NOT NULL,
+    reason VARCHAR(255) NOT NULL,
+    processed_by VARCHAR(150) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_return_invoice FOREIGN KEY (invoice_id)
+        REFERENCES invoices(invoice_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_return_customer FOREIGN KEY (customer_id)
+        REFERENCES customers_khata(customer_id) ON DELETE SET NULL ON UPDATE CASCADE,
+    CONSTRAINT chk_return_amount_positive CHECK (total_refund_amount > 0),
+    INDEX idx_return_invoice (invoice_id),
+    INDEX idx_return_date (created_at)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 11. SALES RETURN ITEMS TABLE
+-- ----------------------------------------------------------------------------
+CREATE TABLE sales_return_items (
+    return_item_id INT AUTO_INCREMENT PRIMARY KEY,
+    return_id INT NOT NULL,
+    invoice_item_id INT NOT NULL,
+    batch_id INT NOT NULL,
+    product_id INT NOT NULL,
+    quantity_returned INT NOT NULL,
+    restock_batch TINYINT(1) NOT NULL DEFAULT 1 COMMENT '1 to restore batch stock, 0 if damaged/discarded',
+    refund_line_total DECIMAL(12, 2) NOT NULL,
+
+    CONSTRAINT fk_retitem_return FOREIGN KEY (return_id)
+        REFERENCES sales_returns(return_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT fk_retitem_batch FOREIGN KEY (batch_id)
+        REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT fk_retitem_product FOREIGN KEY (product_id)
+        REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    CONSTRAINT chk_qty_returned_positive CHECK (quantity_returned > 0)
+) ENGINE=InnoDB;
+
+-- ----------------------------------------------------------------------------
+-- 12. AUDIT LOGS TABLE (AUDIT TRAIL & COMPLIANCE)
+-- ----------------------------------------------------------------------------
+CREATE TABLE audit_logs (
+    log_id INT AUTO_INCREMENT PRIMARY KEY,
+    action_type VARCHAR(60) NOT NULL,
+    entity_type VARCHAR(60) NOT NULL,
+    entity_id VARCHAR(60) NULL,
+    summary VARCHAR(255) NOT NULL,
+    performed_by VARCHAR(150) NOT NULL,
+    role VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    INDEX idx_audit_created (created_at),
+    INDEX idx_audit_action (action_type)
 ) ENGINE=InnoDB;

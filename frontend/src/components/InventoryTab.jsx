@@ -569,6 +569,11 @@ export default function InventoryTab({
                           </div>
                           <div className="text-xs text-slate-500 dark:text-slate-400 font-medium">
                             {product.brand} • <span className="font-mono text-slate-400">HSN: {product.hsn_code}</span>
+                            {product.barcode && (
+                              <span className="ml-2 font-mono text-[10px] bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 px-1.5 py-0.5 rounded border border-emerald-200 dark:border-emerald-800">
+                                SKU: {product.barcode}
+                              </span>
+                            )}
                           </div>
                         </td>
 
@@ -674,9 +679,11 @@ export default function InventoryTab({
                                   <thead>
                                     <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-400">
                                       <th className="py-1.5">Batch Number</th>
+                                      <th className="py-1.5">Distributor</th>
                                       <th className="py-1.5">Mfg Date</th>
                                       <th className="py-1.5">Expiry Date</th>
                                       <th className="py-1.5">Validity</th>
+                                      <th className="py-1.5 text-center">Status</th>
                                       {isAdmin && <th className="py-1.5 text-right">Cost (₹)</th>}
                                       <th className="py-1.5 text-right">MRP (₹)</th>
                                       <th className="py-1.5 text-right">Selling Price (₹)</th>
@@ -689,11 +696,18 @@ export default function InventoryTab({
                                         <td className="py-1.5 font-mono font-bold text-slate-900 dark:text-slate-100">
                                           {b.batch_number}
                                         </td>
+                                        <td className="py-1.5 text-[11px] text-slate-500">
+                                          {b.supplier_name || 'Mysuru Agro Distributor'}
+                                        </td>
                                         <td className="py-1.5 font-mono text-slate-500">{b.mfg_date}</td>
                                         <td className="py-1.5 font-mono text-slate-700 dark:text-slate-300">{b.expiry_date}</td>
                                         <td className="py-1.5">
-                                          {b.is_expiring_soon ? (
+                                          {b.is_expired ? (
                                             <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300">
+                                              Expired ({Math.abs(b.days_to_expiry)}d ago)
+                                            </span>
+                                          ) : b.is_expiring_soon ? (
+                                            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-950/60 dark:text-amber-300">
                                               {b.days_to_expiry} days left
                                             </span>
                                           ) : (
@@ -702,11 +716,22 @@ export default function InventoryTab({
                                             </span>
                                           )}
                                         </td>
-                                          {isAdmin && (
-                                            <td className="py-1.5 text-right font-mono text-slate-500">
-                                              {b.purchase_price != null ? `₹${b.purchase_price.toFixed(2)}` : '—'}
-                                            </td>
-                                          )}
+                                        <td className="py-1.5 text-center">
+                                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full ${
+                                            b.status === 'Active'
+                                              ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+                                              : b.status === 'Expired_Written_Off'
+                                              ? 'bg-red-100 text-red-800 dark:bg-red-950/60 dark:text-red-300'
+                                              : 'bg-slate-100 text-slate-800'
+                                          }`}>
+                                            {b.status || 'Active'}
+                                          </span>
+                                        </td>
+                                        {isAdmin && (
+                                          <td className="py-1.5 text-right font-mono text-slate-500">
+                                            {b.purchase_price != null ? `₹${b.purchase_price.toFixed(2)}` : '—'}
+                                          </td>
+                                        )}
                                         <td className="py-1.5 text-right font-mono text-slate-500 line-through">₹{b.mrp.toFixed(2)}</td>
                                         <td className="py-1.5 text-right font-mono font-bold text-slate-900 dark:text-white">₹{b.selling_price.toFixed(2)}</td>
                                         <td className="py-1.5 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">

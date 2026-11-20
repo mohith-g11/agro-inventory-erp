@@ -5,22 +5,20 @@ import {
   Receipt, 
   BookOpenText, 
   Sprout,
-  LogOut
+  LogOut,
+  History,
+  AlertTriangle,
+  BarChart3
 } from 'lucide-react';
 
 export default function Sidebar({ activeTab, setActiveTab, expiringCount = 0, currentUser, onLogout }) {
+  const isAdmin = currentUser?.role === 'Admin';
+
   const navItems = [
     {
       id: 'dashboard',
       label: 'Dashboard',
       icon: LayoutDashboard,
-      badge: expiringCount > 0 ? `${expiringCount}` : null,
-      badgeColor: 'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300 border border-red-200 dark:border-red-800'
-    },
-    {
-      id: 'inventory',
-      label: 'Stock & Substitutes',
-      icon: Boxes,
       badge: null
     },
     {
@@ -30,14 +28,38 @@ export default function Sidebar({ activeTab, setActiveTab, expiringCount = 0, cu
       badge: null
     },
     {
+      id: 'inventory',
+      label: 'Stock & Batches',
+      icon: Boxes,
+      badge: null
+    },
+    {
       id: 'khata',
       label: 'Farmer Khata (Credit)',
       icon: BookOpenText,
       badge: null
-    }
+    },
+    {
+      id: 'sales',
+      label: 'Sales & Returns',
+      icon: History,
+      badge: null
+    },
+    {
+      id: 'alerts',
+      label: 'Expiry & Alerts',
+      icon: AlertTriangle,
+      badge: expiringCount > 0 ? `${expiringCount}` : null,
+      badgeColor: 'bg-red-100 text-red-700 dark:bg-red-950/60 dark:text-red-300 border border-red-200 dark:border-red-800'
+    },
+    ...(isAdmin ? [{
+      id: 'reports',
+      label: 'Reports & GST',
+      icon: BarChart3,
+      badge: 'Admin',
+      badgeColor: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950/60 dark:text-emerald-300'
+    }] : [])
   ];
-
-  const isAdmin = currentUser?.role === 'Admin';
 
   return (
     <aside className="w-64 bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 flex flex-col justify-between shrink-0 select-none transition-colors">

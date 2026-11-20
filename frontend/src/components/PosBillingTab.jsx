@@ -8,7 +8,9 @@ import {
   Trash2, 
   FileCheck,
   Split,
-  Info
+  Info,
+  Search,
+  CheckCircle2
 } from 'lucide-react';
 import { fetchFEFOPreview, createInvoice } from '../services/api';
 
@@ -18,12 +20,17 @@ export default function PosBillingTab({
   preSelectedProductId = null,
   onInvoiceCreated
 }) {
+  const [isWalkIn, setIsWalkIn] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
   const [selectedProductId, setSelectedProductId] = useState('');
   const [quantity, setQuantity] = useState(1);
   const [fefoPreview, setFefoPreview] = useState(null);
   const [fefoLoading, setFefoLoading] = useState(false);
   const [fefoError, setFefoError] = useState(null);
+
+  // Barcode / SKU quick scan input
+  const [barcodeQuery, setBarcodeQuery] = useState('');
+  const [barcodeMessage, setBarcodeMessage] = useState(null);
 
   // Cart line items
   const [cartItems, setCartItems] = useState([]);
@@ -35,7 +42,7 @@ export default function PosBillingTab({
   const [errorMessage, setErrorMessage] = useState('');
 
   // Selected customer object
-  const currentCustomer = customers.find(c => c.customer_id === Number(selectedCustomerId));
+  const currentCustomer = isWalkIn ? null : customers.find(c => c.customer_id === Number(selectedCustomerId));
 
   // Initialize preSelected product if passed
   useEffect(() => {
@@ -48,10 +55,35 @@ export default function PosBillingTab({
 
   // Set default customer
   useEffect(() => {
-    if (customers.length > 0 && !selectedCustomerId) {
+    if (customers.length > 0 && !selectedCustomerId && !isWalkIn) {
       setSelectedCustomerId(String(customers[0].customer_id));
     }
-  }, [customers]);
+  }, [customers, isWalkIn]);
+
+  // Handle fast barcode lookup
+  const handleBarcodeLookup = (code) => {
+    setBarcodeMessage(null);
+    if (!code || !code.trim()) return;
+    const trimmed = code.trim().toLowerCase();
+
+    // Match barcode exact, then name, then composition
+    const match = inventory.find(p => 
+      (p.barcode && p.barcode.toLowerCase() === trimmed) ||
+      p.name.toLowerCase().includes(trimmed) ||
+      (p.chemical_composition && p.chemical_composition.toLowerCase().includes(trimmed))
+    );
+
+    if (match) {
+      setSelectedProductId(String(match.product_id));
+      setQuantity(1);
+      setBarcodeMessage(`Found: ${match.name} (Barcode: ${match.barcode || 'N/A'})`);
+      setBarcodeQuery('');
+      setTimeout(() => setBarcodeMessage(null), 3000);
+    } else {
+      setBarcodeMessage(`No matching product found for "${code}"`);
+      setTimeout(() => setBarcodeMessage(null), 3500);
+    }
+  };
 
   // Fetch FEFO Preview whenever selected product or quantity changes
   useEffect(() => {
@@ -163,8 +195,12 @@ export default function PosBillingTab({
   // Submit and create invoice
   const handleFinalizeBill = async () => {
     setErrorMessage('');
-    if (!selectedCustomerId) {
-      setErrorMessage('Please select a Farmer.');
+    if (!isWalkIn && !selectedCustomerId) {
+      setErrorMessage('Please select a Farmer or check Walk-in Counter Customer.');
+      return;
+    }
+    if (isWalkIn && (paymentMode === 'Credit_Khata' || paymentMode === 'Partial_Credit')) {
+      setErrorMessage('Walk-in counter sales cannot be added to Khata. Please choose Cash or UPI.');
       return;
     }
     if (cartItems.length === 0) {
@@ -179,7 +215,7 @@ export default function PosBillingTab({
     setIsSubmitting(true);
     try {
       const payload = {
-        customer_id: Number(selectedCustomerId),
+        customer_id: isWalkIn ? null : Number(selectedCustomerId),
         payment_mode: paymentMode,
         amount_paid: amountPaid,
         items: cartItems.map(item => ({
@@ -229,54 +265,122 @@ export default function PosBillingTab({
         <div className="lg:col-span-7 space-y-5">
           {/* 1. Farmer Selection Card */}
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-3">
-            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
-              <User className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-              Farmer (Khata Account)
-            </label>
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                <User className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                Customer Account
+              </label>
 
-            {/* Larger Farmer Select Dropdown */}
-            <select
-              value={selectedCustomerId}
-              onChange={(e) => setSelectedCustomerId(e.target.value)}
-              className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-emerald-600 transition"
-            >
-              {customers.map((c) => (
-                <option key={c.customer_id} value={c.customer_id}>
-                  {c.farmer_name} • {c.village} ({c.primary_crop}) — Due: ₹{c.total_credit_due} / Limit: ₹{c.credit_limit}
-                </option>
-              ))}
-            </select>
+              {/* Walk-in Counter Sale Checkbox */}
+              <label className="flex items-center gap-2 cursor-pointer select-none px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition">
+                <input
+                  type="checkbox"
+                  checked={isWalkIn}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setIsWalkIn(checked);
+                    if (checked && (paymentMode === 'Credit_Khata' || paymentMode === 'Partial_Credit')) {
+                      setPaymentMode('Cash');
+                    }
+                  }}
+                  className="w-4 h-4 text-emerald-600 rounded border-slate-300 focus:ring-emerald-500"
+                />
+                <span className="text-xs font-bold text-slate-800 dark:text-slate-200">
+                  Walk-in Counter (No Khata)
+                </span>
+              </label>
+            </div>
 
-            {currentCustomer && (
-              <div className="grid grid-cols-3 gap-3 p-3 bg-slate-50 dark:bg-slate-950/60 rounded-lg text-xs">
-                <div>
-                  <div className="text-slate-500">Village & Crop</div>
-                  <div className="font-semibold text-slate-800 dark:text-slate-200 mt-0.5">
-                    {currentCustomer.village} • {currentCustomer.primary_crop}
-                  </div>
+            {/* Farmer Select Dropdown or Walk-in Notice */}
+            {isWalkIn ? (
+              <div className="p-3 bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800/60 rounded-lg text-xs flex items-center justify-between text-emerald-800 dark:text-emerald-300">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <span className="font-bold">Walk-in Counter Customer Selected</span>
                 </div>
-                <div>
-                  <div className="text-slate-500">Current Due</div>
-                  <div className="font-bold text-sky-700 dark:text-sky-400 mt-0.5">
-                    ₹{currentCustomer.total_credit_due?.toFixed(2)}
-                  </div>
-                </div>
-                <div>
-                  <div className="text-slate-500">Available Limit</div>
-                  <div className="font-bold text-emerald-700 dark:text-emerald-400 mt-0.5">
-                    ₹{currentCustomer.available_credit?.toFixed(2)}
-                  </div>
-                </div>
+                <span className="text-[11px] text-emerald-700 dark:text-emerald-400">Cash / UPI billing</span>
               </div>
+            ) : (
+              <>
+                <select
+                  value={selectedCustomerId}
+                  onChange={(e) => setSelectedCustomerId(e.target.value)}
+                  className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-emerald-600 transition"
+                >
+                  {customers.map((c) => (
+                    <option key={c.customer_id} value={c.customer_id}>
+                      {c.farmer_name} • {c.village} ({c.primary_crop}) — Due: ₹{c.total_credit_due} / Limit: ₹{c.credit_limit}
+                    </option>
+                  ))}
+                </select>
+
+                {currentCustomer && (
+                  <div className="grid grid-cols-3 gap-3 p-3 bg-slate-50 dark:bg-slate-950/60 rounded-lg text-xs">
+                    <div>
+                      <div className="text-slate-500">Village & Crop</div>
+                      <div className="font-semibold text-slate-800 dark:text-slate-200 mt-0.5">
+                        {currentCustomer.village} • {currentCustomer.primary_crop}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-slate-500">Current Due</div>
+                      <div className="font-bold text-sky-700 dark:text-sky-400 mt-0.5">
+                        ₹{currentCustomer.total_credit_due?.toFixed(2)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-slate-500">Available Limit</div>
+                      <div className="font-bold text-emerald-700 dark:text-emerald-400 mt-0.5">
+                        ₹{currentCustomer.available_credit?.toFixed(2)}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </>
             )}
           </div>
 
           {/* 2. Product & Quantity Selector */}
           <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
-            <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
-              <ShoppingBag className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-              Product & Quantity
-            </label>
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider flex items-center gap-2">
+                <ShoppingBag className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                Product & Quantity
+              </label>
+              <span className="text-[11px] text-slate-400">FEFO Auto-Allocation</span>
+            </div>
+
+            {/* Quick Barcode Scan / SKU Lookup */}
+            <div>
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-3 top-2.5 text-emerald-600" />
+                <input
+                  type="text"
+                  placeholder="Scan barcode or type SKU (e.g., SMAK-IFF-1919) and press Enter..."
+                  value={barcodeQuery}
+                  onChange={(e) => setBarcodeQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleBarcodeLookup(barcodeQuery);
+                    }
+                  }}
+                  className="w-full pl-9 pr-20 py-2 text-xs rounded-lg border border-emerald-300 dark:border-emerald-800 bg-emerald-50/40 dark:bg-emerald-950/20 text-slate-900 dark:text-slate-100 font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                />
+                <button
+                  type="button"
+                  onClick={() => handleBarcodeLookup(barcodeQuery)}
+                  className="absolute right-1 top-1 px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white text-[11px] font-bold rounded-md transition"
+                >
+                  Find
+                </button>
+              </div>
+              {barcodeMessage && (
+                <div className={`text-[11px] mt-1 font-semibold ${barcodeMessage.startsWith('Found') ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                  {barcodeMessage}
+                </div>
+              )}
+            </div>
 
             {/* Larger Product Select Dropdown */}
             <select
@@ -286,7 +390,7 @@ export default function PosBillingTab({
             >
               {inventory.map((p) => (
                 <option key={p.product_id} value={p.product_id}>
-                  {p.name} ({p.brand}) — Stock: {p.total_stock} {p.base_unit} [GST: {p.gst_slab}%]
+                  {p.name} ({p.brand}) — Stock: {p.total_stock} {p.base_unit} [GST: {p.gst_slab}%]{p.barcode ? ` [Barcode: ${p.barcode}]` : ''}
                 </option>
               ))}
             </select>
@@ -475,17 +579,21 @@ export default function PosBillingTab({
                 {[
                   { id: 'Cash', label: 'Cash' },
                   { id: 'UPI', label: 'UPI / QR' },
-                  { id: 'Credit_Khata', label: 'Farmer Khata' },
-                  { id: 'Partial_Credit', label: 'Partial Khata' },
+                  { id: 'Credit_Khata', label: 'Farmer Khata', disabled: isWalkIn },
+                  { id: 'Partial_Credit', label: 'Partial Khata', disabled: isWalkIn },
                 ].map((mode) => {
                   const isSelected = paymentMode === mode.id;
                   return (
                     <button
                       key={mode.id}
                       type="button"
-                      onClick={() => setPaymentMode(mode.id)}
+                      disabled={mode.disabled}
+                      onClick={() => !mode.disabled && setPaymentMode(mode.id)}
+                      title={mode.disabled ? 'Khata credit requires a registered farmer' : ''}
                       className={`p-2.5 rounded-lg border text-center text-xs font-semibold transition ${
-                        isSelected
+                        mode.disabled
+                          ? 'bg-slate-100 dark:bg-slate-800/40 text-slate-400 border-slate-200 dark:border-slate-800 cursor-not-allowed opacity-50'
+                          : isSelected
                           ? 'bg-emerald-600 text-white border-emerald-600 shadow-sm'
                           : 'bg-slate-50 dark:bg-slate-950 border-slate-200 dark:border-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
                       }`}

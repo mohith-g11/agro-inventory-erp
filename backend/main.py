@@ -6,14 +6,17 @@ Implements Phase 1 Retail & Inventory ERP REST APIs.
 from fastapi import FastAPI, HTTPException, Query, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import List, Optional
 import sqlite3
 import datetime
 import re
+import csv
+import io
 from pathlib import Path
 from database import get_db, init_db
+import database
 from auth import get_current_user, require_admin
 
 app = FastAPI(
@@ -76,6 +79,7 @@ class ProductCreate(BaseModel):
     bulk_unit: str
     conversion_factor: float = Field(1.0, gt=0)
     reorder_level: float = Field(10.0, ge=0)
+    barcode: Optional[str] = None
 
 class BatchCreate(BaseModel):
     product_id: int
@@ -87,6 +91,7 @@ class BatchCreate(BaseModel):
     selling_price: float = Field(..., gt=0)
     available_qty: Optional[float] = None
     quantity: Optional[float] = None
+    supplier_id: Optional[int] = None
 
 class CustomerCreate(BaseModel):
     farmer_name: str = Field(..., min_length=2, max_length=120)
@@ -147,10 +152,25 @@ class InvoiceItemCreate(BaseModel):
     qty: float
 
 class InvoiceCreate(BaseModel):
-    customer_id: int
+    customer_id: Optional[int] = None
     payment_mode: str = Field(..., pattern="^(Cash|UPI|Credit_Khata|Partial_Credit)$")
-    amount_paid: float
+    amount_paid: float = 0.0
     items: List[InvoiceItemCreate]
+
+class StockAdjustmentCreate(BaseModel):
+    adjustment_type: str = Field(..., pattern="^(Expired_WriteOff|Damaged|Return_To_Supplier|Audit_Increase|Audit_Decrease)$")
+    quantity_change: int
+    reason: str = Field(..., min_length=2, max_length=255)
+
+class SalesReturnItemCreate(BaseModel):
+    invoice_item_id: int
+    quantity_returned: int = Field(..., gt=0)
+    restock_batch: bool = True
+
+class SalesReturnCreate(BaseModel):
+    refund_mode: str = Field(..., pattern="^(Cash|UPI|Khata_Credit_Adjustment)$")
+    reason: str = Field(..., min_length=2, max_length=255)
+    items: List[SalesReturnItemCreate]
 
 # -----------------------------------------------------------------------------
 # Auth routes: POST /api/auth/login, GET /api/auth/me
@@ -339,7 +359,8 @@ def get_inventory(current_user: dict = Depends(get_current_user)):
             p.base_unit,
             p.bulk_unit,
             p.conversion_factor,
-            p.reorder_level
+            p.reorder_level,
+            p.barcode
         FROM products p
         ORDER BY p.name ASC;
     """)
@@ -347,26 +368,30 @@ def get_inventory(current_user: dict = Depends(get_current_user)):
 
     cursor.execute("""
         SELECT 
-            batch_id,
-            product_id,
-            batch_number,
-            mfg_date,
-            expiry_date,
-            purchase_price,
-            mrp,
-            selling_price,
-            available_qty,
-            CAST((julianday(expiry_date) - julianday('now')) AS INT) AS days_to_expiry,
+            b.batch_id,
+            b.product_id,
+            b.batch_number,
+            b.mfg_date,
+            b.expiry_date,
+            b.purchase_price,
+            b.mrp,
+            b.selling_price,
+            b.available_qty,
+            b.supplier_id,
+            COALESCE(s.name, '-') AS supplier_name,
+            b.status,
+            CAST((julianday(b.expiry_date) - julianday('now')) AS INT) AS days_to_expiry,
             CASE 
-                WHEN expiry_date < date('now') THEN 1 
+                WHEN b.expiry_date < date('now') THEN 1 
                 ELSE 0 
             END AS is_expired,
             CASE 
-                WHEN expiry_date >= date('now') AND expiry_date <= date('now', '+30 days') THEN 1 
+                WHEN b.expiry_date >= date('now') AND b.expiry_date <= date('now', '+30 days') THEN 1 
                 ELSE 0 
             END AS is_expiring_soon
-        FROM inventory_batches
-        ORDER BY expiry_date ASC, batch_id ASC;
+        FROM inventory_batches b
+        LEFT JOIN suppliers s ON b.supplier_id = s.supplier_id
+        ORDER BY b.expiry_date ASC, b.batch_id ASC;
     """)
     all_batches = [dict(row) for row in cursor.fetchall()]
     conn.close()
@@ -515,6 +540,7 @@ def get_fefo_preview(
         JOIN products p ON b.product_id = p.product_id
         WHERE b.product_id = ?
           AND b.available_qty > 0
+          AND b.status = 'Active'
           AND b.expiry_date > date('now')
     )
     SELECT 
@@ -667,13 +693,20 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
     try:
         cursor.execute("BEGIN TRANSACTION;")
 
-        # Validate customer
-        cursor.execute("SELECT customer_id, farmer_name, total_credit_due, credit_limit FROM customers_khata WHERE customer_id = ?", (invoice_data.customer_id,))
-        cust = cursor.fetchone()
-        if not cust:
-            raise HTTPException(status_code=404, detail="Customer not found")
-
-        cust_info = dict(cust)
+        # Validate customer or handle walk-in counter sale
+        if invoice_data.customer_id is None:
+            if invoice_data.payment_mode in ("Credit_Khata", "Partial_Credit"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Credit Khata or Partial Credit requires a registered farmer. Walk-in sales only allow Cash or UPI."
+                )
+            cust_info = {"farmer_name": "Walk-in Customer", "total_credit_due": 0.0, "credit_limit": 0.0}
+        else:
+            cursor.execute("SELECT customer_id, farmer_name, total_credit_due, credit_limit FROM customers_khata WHERE customer_id = ?", (invoice_data.customer_id,))
+            cust = cursor.fetchone()
+            if not cust:
+                raise HTTPException(status_code=404, detail="Customer not found")
+            cust_info = dict(cust)
 
         total_subtotal = 0.0
         total_cgst = 0.0
@@ -711,6 +744,7 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
                 JOIN products p ON b.product_id = p.product_id
                 WHERE b.product_id = ?
                   AND b.available_qty > 0
+                  AND b.status = 'Active'
                   AND b.expiry_date > date('now')
             )
             SELECT 
@@ -809,8 +843,8 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
         # Insert invoice header
         cursor.execute("""
             INSERT INTO invoices 
-            (invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata, billed_by)
-            VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?);
+            (invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata, billed_by, status)
+            VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, 'Completed');
         """, (
             invoice_number,
             invoice_data.customer_id,
@@ -843,12 +877,23 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
                 item["line_total"]
             ))
 
+        database.log_audit(
+            conn,
+            "SALE",
+            "invoice",
+            invoice_number,
+            f"Tax Invoice {invoice_number} generated for {cust_info['farmer_name']} - Rs {grand_total:.2f} ({invoice_data.payment_mode})",
+            current_user.get("full_name", "Staff"),
+            current_user.get("role", "Staff")
+        )
+
         conn.commit()
 
         return {
             "success": True,
             "invoice_id": invoice_id,
             "invoice_number": invoice_number,
+            "customer_id": invoice_data.customer_id,
             "farmer_name": cust_info["farmer_name"],
             "subtotal": total_subtotal,
             "total_cgst": total_cgst,
@@ -858,6 +903,7 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
             "amount_paid": amount_paid,
             "balance_added_to_khata": balance_khata,
             "billed_by": current_user.get("full_name"),
+            "status": "Completed",
             "items": allocated_items
         }
 
@@ -873,15 +919,46 @@ def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get
 # 7. GET /api/invoices
 # -----------------------------------------------------------------------------
 @app.get("/api/invoices")
-def list_invoices(current_user: dict = Depends(get_current_user)):
+def list_invoices(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    payment_mode: Optional[str] = None,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 200,
+    current_user: dict = Depends(get_current_user)
+):
     """Returns recent invoices with customer information and items."""
     conn = get_db()
     cursor = conn.cursor()
 
-    cursor.execute("""
+    conditions = []
+    params = []
+
+    if start_date:
+        conditions.append("date(i.invoice_date) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        conditions.append("date(i.invoice_date) <= date(?)")
+        params.append(end_date)
+    if payment_mode:
+        conditions.append("i.payment_mode = ?")
+        params.append(payment_mode)
+    if status:
+        conditions.append("i.status = ?")
+        params.append(status)
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        conditions.append("(i.invoice_number LIKE ? OR c.farmer_name LIKE ? OR c.phone LIKE ? OR c.village LIKE ?)")
+        params.extend([search_pattern, search_pattern, search_pattern, search_pattern])
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    query = f"""
         SELECT 
             i.invoice_id,
             i.invoice_number,
+            i.customer_id,
             i.invoice_date,
             i.subtotal,
             i.total_cgst,
@@ -891,13 +968,18 @@ def list_invoices(current_user: dict = Depends(get_current_user)):
             i.amount_paid,
             i.balance_added_to_khata,
             i.billed_by,
-            c.farmer_name,
+            i.status,
+            COALESCE(c.farmer_name, 'Walk-in Customer') AS farmer_name,
             c.village,
             c.phone
         FROM invoices i
-        JOIN customers_khata c ON i.customer_id = c.customer_id
-        ORDER BY i.invoice_id DESC;
-    """)
+        LEFT JOIN customers_khata c ON i.customer_id = c.customer_id
+        {where_clause}
+        ORDER BY i.invoice_id DESC
+        LIMIT ?;
+    """
+    params.append(limit)
+    cursor.execute(query, tuple(params))
     invoices = [dict(row) for row in cursor.fetchall()]
 
     for inv in invoices:
@@ -1198,11 +1280,32 @@ def create_supplier(supplier_data: SupplierCreate, admin_user: dict = Depends(re
 
 # 9. GET /api/products & POST /api/products
 @app.get("/api/products")
-def list_products(current_user: dict = Depends(get_current_user)):
-    """Returns list of products from the catalog."""
+def list_products(
+    search: Optional[str] = None,
+    category: Optional[str] = None,
+    barcode: Optional[str] = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """Returns list of products from the catalog with optional search, category, or barcode filtering."""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
+
+    conditions = []
+    params = []
+    if barcode:
+        conditions.append("barcode = ?")
+        params.append(barcode.strip())
+    if category:
+        conditions.append("category = ?")
+        params.append(category)
+    if search:
+        search_pattern = f"%{search.strip()}%"
+        conditions.append("(barcode = ? OR name LIKE ? OR brand LIKE ? OR chemical_composition LIKE ? OR hsn_code LIKE ?)")
+        params.extend([search.strip(), search_pattern, search_pattern, search_pattern, search_pattern])
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+    cursor.execute(f"""
         SELECT 
             product_id,
             name,
@@ -1215,10 +1318,12 @@ def list_products(current_user: dict = Depends(get_current_user)):
             bulk_unit,
             conversion_factor,
             reorder_level,
+            barcode,
             created_at
         FROM products
+        {where_clause}
         ORDER BY name ASC;
-    """)
+    """, tuple(params))
     products = [dict(row) for row in cursor.fetchall()]
     conn.close()
     return products
@@ -1238,6 +1343,7 @@ def create_product(product_data: ProductCreate, admin_user: dict = Depends(requi
     bulk_unit = product_data.bulk_unit.strip()
     conversion_factor = float(product_data.conversion_factor)
     reorder_level = float(product_data.reorder_level)
+    barcode = product_data.barcode.strip() if product_data.barcode else None
 
     if not name:
         raise HTTPException(status_code=400, detail="Product name cannot be empty")
@@ -1292,14 +1398,23 @@ def create_product(product_data: ProductCreate, admin_user: dict = Depends(requi
     try:
         cursor.execute("""
             INSERT INTO products 
-            (name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """, (name, brand, category, chemical_comp, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level))
+            (name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level, barcode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """, (name, brand, category, chemical_comp, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level, barcode))
         product_id = cursor.lastrowid
+        database.log_audit(
+            conn,
+            "PRODUCT_CATALOG",
+            "product",
+            str(product_id),
+            f"Added product {name} ({brand}) - Category: {category}",
+            admin_user.get("full_name", "Admin"),
+            admin_user.get("role", "Admin")
+        )
         conn.commit()
 
         cursor.execute("""
-            SELECT product_id, name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level, created_at
+            SELECT product_id, name, brand, category, chemical_composition, hsn_code, gst_slab, base_unit, bulk_unit, conversion_factor, reorder_level, barcode, created_at
             FROM products WHERE product_id = ?;
         """, (product_id,))
         new_prod = dict(cursor.fetchone())
@@ -1398,10 +1513,16 @@ def create_batch(batch_data: BatchCreate, admin_user: dict = Depends(require_adm
                 detail=f"Batch '{batch_no}' already exists for product '{dict(prod)['name']}'"
             )
 
+        supplier_id = batch_data.supplier_id
+        if supplier_id is not None:
+            cursor.execute("SELECT supplier_id FROM suppliers WHERE supplier_id = ?", (supplier_id,))
+            if not cursor.fetchone():
+                raise HTTPException(status_code=400, detail=f"Supplier ID {supplier_id} not found")
+
         cursor.execute("""
             INSERT INTO inventory_batches 
-            (product_id, batch_number, mfg_date, expiry_date, purchase_price, mrp, selling_price, available_qty)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+            (product_id, batch_number, mfg_date, expiry_date, purchase_price, mrp, selling_price, available_qty, supplier_id, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active');
         """, (
             batch_data.product_id,
             batch_no,
@@ -1410,9 +1531,21 @@ def create_batch(batch_data: BatchCreate, admin_user: dict = Depends(require_adm
             round(pp, 2),
             round(mrp, 2),
             round(sp, 2),
-            round(qty, 2)
+            round(qty, 2),
+            supplier_id
         ))
         batch_id = cursor.lastrowid
+
+        database.log_audit(
+            conn,
+            "STOCK_INWARD",
+            "batch",
+            str(batch_id),
+            f"Stock Inward GRN: Batch {batch_no} for {dict(prod)['name']} - Qty {qty}",
+            admin_user.get("full_name", "Admin"),
+            admin_user.get("role", "Admin")
+        )
+
         conn.commit()
 
         cursor.execute("""
@@ -1426,6 +1559,8 @@ def create_batch(batch_data: BatchCreate, admin_user: dict = Depends(require_adm
                 mrp,
                 selling_price,
                 available_qty,
+                supplier_id,
+                status,
                 CAST((julianday(expiry_date) - julianday('now')) AS INT) AS days_to_expiry,
                 CASE 
                     WHEN expiry_date < date('now') THEN 1 
@@ -1780,3 +1915,820 @@ def get_customer_ledger(customer_id: int, current_user: dict = Depends(get_curre
         },
         "statement": statement
     }
+
+
+# =============================================================================
+# Phase 3: Expiry Action Center & Stock Adjustments
+# =============================================================================
+
+@app.get("/api/alerts/inventory")
+def get_inventory_alerts(current_user: dict = Depends(get_current_user)):
+    """
+    Returns expired batches, expiring batches (30 and 90 days), low stock products,
+    and high credit risk farmers. Masks landing costs for staff users.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    is_staff = current_user.get("role") == "Staff"
+
+    # 1. Expired batches
+    cursor.execute("""
+        SELECT b.batch_id, b.product_id, p.name AS product_name, p.brand, p.category,
+               b.batch_number, b.mfg_date, b.expiry_date, b.available_qty, p.base_unit,
+               b.purchase_price, b.selling_price, b.mrp, b.status,
+               COALESCE(s.name, 'Direct Distributor') AS supplier_name, s.phone AS supplier_phone,
+               CAST((julianday('now') - julianday(b.expiry_date)) AS INT) AS days_overdue
+        FROM inventory_batches b
+        JOIN products p ON b.product_id = p.product_id
+        LEFT JOIN suppliers s ON b.supplier_id = s.supplier_id
+        WHERE b.expiry_date < date('now')
+          AND b.available_qty > 0
+          AND b.status = 'Active'
+        ORDER BY b.expiry_date ASC;
+    """)
+    expired_batches = [dict(r) for r in cursor.fetchall()]
+
+    # 2. Expiring in 30 days
+    cursor.execute("""
+        SELECT b.batch_id, b.product_id, p.name AS product_name, p.brand, p.category,
+               b.batch_number, b.mfg_date, b.expiry_date, b.available_qty, p.base_unit,
+               b.purchase_price, b.selling_price, b.mrp, b.status,
+               COALESCE(s.name, 'Direct Distributor') AS supplier_name, s.phone AS supplier_phone,
+               CAST((julianday(b.expiry_date) - julianday('now')) AS INT) AS days_to_expiry
+        FROM inventory_batches b
+        JOIN products p ON b.product_id = p.product_id
+        LEFT JOIN suppliers s ON b.supplier_id = s.supplier_id
+        WHERE b.expiry_date >= date('now')
+          AND b.expiry_date <= date('now', '+30 days')
+          AND b.available_qty > 0
+          AND b.status = 'Active'
+        ORDER BY b.expiry_date ASC;
+    """)
+    expiring_30_days = [dict(r) for r in cursor.fetchall()]
+
+    # 3. Expiring in 31 to 90 days
+    cursor.execute("""
+        SELECT b.batch_id, b.product_id, p.name AS product_name, p.brand, p.category,
+               b.batch_number, b.mfg_date, b.expiry_date, b.available_qty, p.base_unit,
+               b.purchase_price, b.selling_price, b.mrp, b.status,
+               COALESCE(s.name, 'Direct Distributor') AS supplier_name, s.phone AS supplier_phone,
+               CAST((julianday(b.expiry_date) - julianday('now')) AS INT) AS days_to_expiry
+        FROM inventory_batches b
+        JOIN products p ON b.product_id = p.product_id
+        LEFT JOIN suppliers s ON b.supplier_id = s.supplier_id
+        WHERE b.expiry_date > date('now', '+30 days')
+          AND b.expiry_date <= date('now', '+90 days')
+          AND b.available_qty > 0
+          AND b.status = 'Active'
+        ORDER BY b.expiry_date ASC;
+    """)
+    expiring_90_days = [dict(r) for r in cursor.fetchall()]
+
+    # 4. Low stock products
+    cursor.execute("""
+        SELECT p.product_id, p.name, p.brand, p.category, p.reorder_level, p.base_unit, p.barcode,
+               COALESCE(SUM(CASE WHEN b.expiry_date > date('now') AND b.status = 'Active' THEN b.available_qty ELSE 0 END), 0) AS current_stock,
+               (
+                   SELECT s.supplier_id FROM inventory_batches b2 
+                   JOIN suppliers s ON b2.supplier_id = s.supplier_id 
+                   WHERE b2.product_id = p.product_id 
+                   ORDER BY b2.batch_id DESC LIMIT 1
+               ) AS preferred_supplier_id,
+               (
+                   SELECT s.name FROM inventory_batches b2 
+                   JOIN suppliers s ON b2.supplier_id = s.supplier_id 
+                   WHERE b2.product_id = p.product_id 
+                   ORDER BY b2.batch_id DESC LIMIT 1
+               ) AS preferred_supplier_name,
+               (
+                   SELECT s.phone FROM inventory_batches b2 
+                   JOIN suppliers s ON b2.supplier_id = s.supplier_id 
+                   WHERE b2.product_id = p.product_id 
+                   ORDER BY b2.batch_id DESC LIMIT 1
+               ) AS preferred_supplier_phone
+        FROM products p
+        LEFT JOIN inventory_batches b ON p.product_id = b.product_id
+        GROUP BY p.product_id
+        HAVING current_stock <= p.reorder_level
+        ORDER BY current_stock ASC;
+    """)
+    low_stock_products = [dict(r) for r in cursor.fetchall()]
+
+    # 5. High credit risk farmers
+    cursor.execute("""
+        SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit,
+               ROUND((total_credit_due / credit_limit) * 100.0, 1) AS credit_utilization_pct
+        FROM customers_khata
+        WHERE total_credit_due > 0
+        ORDER BY total_credit_due DESC;
+    """)
+    high_credit_farmers = [dict(r) for r in cursor.fetchall()]
+
+    # Calculate loss exposure
+    total_loss_exposure = 0.0
+    for eb in expired_batches:
+        total_loss_exposure += eb["available_qty"] * (eb["purchase_price"] or 0.0)
+
+    # Mask costs for staff
+    if is_staff:
+        for b in expired_batches:
+            b["purchase_price"] = None
+        for b in expiring_30_days:
+            b["purchase_price"] = None
+        for b in expiring_90_days:
+            b["purchase_price"] = None
+        total_loss_exposure = None
+
+    conn.close()
+
+    return {
+        "summary": {
+            "expired_count": len(expired_batches),
+            "expiring_30_count": len(expiring_30_days),
+            "expiring_90_count": len(expiring_90_days),
+            "low_stock_count": len(low_stock_products),
+            "high_credit_count": len([f for f in high_credit_farmers if f["credit_utilization_pct"] >= 80]),
+            "total_loss_exposure": round(total_loss_exposure, 2) if total_loss_exposure is not None else None
+        },
+        "expired_batches": expired_batches,
+        "expiring_30_days": expiring_30_days,
+        "expiring_90_days": expiring_90_days,
+        "low_stock_products": low_stock_products,
+        "high_credit_farmers": high_credit_farmers
+    }
+
+
+@app.post("/api/batches/{batch_id}/adjust")
+def adjust_batch_stock(
+    batch_id: int,
+    adj_data: StockAdjustmentCreate,
+    admin_user: dict = Depends(require_admin)
+):
+    """
+    ACID stock adjustment for expiry write-offs, damaged stock, supplier returns, or count corrections.
+    Restricted to Admin.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+        cursor.execute("""
+            SELECT b.batch_id, b.product_id, b.batch_number, b.available_qty, b.purchase_price, b.status, p.name AS product_name
+            FROM inventory_batches b
+            JOIN products p ON b.product_id = p.product_id
+            WHERE b.batch_id = ?;
+        """, (batch_id,))
+        batch = cursor.fetchone()
+        if not batch:
+            raise HTTPException(status_code=404, detail="Batch not found")
+
+        b_dict = dict(batch)
+        new_qty = b_dict["available_qty"] + adj_data.quantity_change
+        if new_qty < 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Adjustment of {adj_data.quantity_change} would result in negative stock ({new_qty}). Available stock: {b_dict['available_qty']}"
+            )
+
+        cost_impact = round(abs(adj_data.quantity_change) * b_dict["purchase_price"], 2)
+        new_status = b_dict["status"]
+        if adj_data.adjustment_type == "Expired_WriteOff":
+            new_status = "Expired_Written_Off"
+        elif new_qty == 0 and b_dict["status"] == "Active":
+            new_status = "Depleted"
+        elif new_qty > 0 and b_dict["status"] == "Depleted":
+            new_status = "Active"
+
+        cursor.execute("""
+            UPDATE inventory_batches
+            SET available_qty = ?, status = ?
+            WHERE batch_id = ?;
+        """, (new_qty, new_status, batch_id))
+
+        cursor.execute("""
+            INSERT INTO stock_adjustments 
+            (batch_id, product_id, adjustment_type, quantity_change, cost_impact, reason, performed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+        """, (
+            batch_id,
+            b_dict["product_id"],
+            adj_data.adjustment_type,
+            adj_data.quantity_change,
+            cost_impact,
+            adj_data.reason.strip(),
+            admin_user.get("full_name", "Admin")
+        ))
+        adj_id = cursor.lastrowid
+
+        database.log_audit(
+            conn,
+            "STOCK_ADJUSTMENT",
+            "batch",
+            str(batch_id),
+            f"{adj_data.adjustment_type}: {adj_data.quantity_change} units ({b_dict['product_name']} Batch {b_dict['batch_number']}). Cost impact: Rs {cost_impact:.2f}. Reason: {adj_data.reason.strip()}",
+            admin_user.get("full_name", "Admin"),
+            admin_user.get("role", "Admin")
+        )
+
+        conn.commit()
+        return {
+            "success": True,
+            "adjustment_id": adj_id,
+            "batch_id": batch_id,
+            "product_name": b_dict["product_name"],
+            "batch_number": b_dict["batch_number"],
+            "previous_qty": b_dict["available_qty"],
+            "new_qty": new_qty,
+            "quantity_change": adj_data.quantity_change,
+            "cost_impact": cost_impact,
+            "status": new_status,
+            "message": f"Successfully adjusted batch {b_dict['batch_number']} stock by {adj_data.quantity_change} units"
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/stock-adjustments")
+def get_stock_adjustments(admin_user: dict = Depends(require_admin)):
+    """Returns recent stock adjustments audit trail (Admin only)."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT sa.adjustment_id, sa.batch_id, sa.product_id, sa.adjustment_type, sa.quantity_change,
+               sa.cost_impact, sa.reason, sa.performed_by, sa.created_at,
+               p.name AS product_name, p.brand, p.base_unit, b.batch_number
+        FROM stock_adjustments sa
+        JOIN products p ON sa.product_id = p.product_id
+        JOIN inventory_batches b ON sa.batch_id = b.batch_id
+        ORDER BY sa.created_at DESC;
+    """)
+    adjustments = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return adjustments
+
+
+# =============================================================================
+# Phase 3: Sales Returns (Credit Notes) & Universal Sales Register
+# =============================================================================
+
+@app.post("/api/invoices/{invoice_id}/return")
+def create_sales_return(
+    invoice_id: int,
+    return_data: SalesReturnCreate,
+    admin_user: dict = Depends(require_admin)
+):
+    """
+    ACID transaction for GST Sales Returns / Credit Notes:
+    1. Validates return quantities against billed and previously returned quantities
+    2. Calculates proportional refund amounts
+    3. Restores batch stock if restock_batch is true
+    4. Adjusts farmer Khata balance if refund_mode is Khata_Credit_Adjustment
+    5. Issues Credit Note (CN-SMAK-2026-XXXX) and updates invoice status
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN TRANSACTION;")
+        # Fetch invoice
+        cursor.execute("""
+            SELECT i.invoice_id, i.invoice_number, i.customer_id, i.payment_mode, i.grand_total, i.amount_paid,
+                   i.balance_added_to_khata, i.status, c.farmer_name
+            FROM invoices i
+            LEFT JOIN customers_khata c ON i.customer_id = c.customer_id
+            WHERE i.invoice_id = ?;
+        """, (invoice_id,))
+        inv = cursor.fetchone()
+        if not inv:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        inv_dict = dict(inv)
+        if inv_dict["status"] == "Returned":
+            raise HTTPException(status_code=400, detail="This invoice has already been fully returned")
+
+        # Fetch prior returns for this invoice
+        cursor.execute("""
+            SELECT sri.invoice_item_id, SUM(sri.quantity_returned) AS total_returned
+            FROM sales_return_items sri
+            JOIN sales_returns sr ON sri.return_id = sr.return_id
+            WHERE sr.invoice_id = ?
+            GROUP BY sri.invoice_item_id;
+        """, (invoice_id,))
+        already_returned = {r["invoice_item_id"]: r["total_returned"] for r in cursor.fetchall()}
+
+        if not return_data.items:
+            raise HTTPException(status_code=400, detail="At least one item must be returned")
+
+        total_refund_amount = 0.0
+        processed_items = []
+
+        for item in return_data.items:
+            cursor.execute("""
+                SELECT ii.item_id, ii.invoice_id, ii.product_id, ii.batch_id, ii.qty_billed,
+                       ii.unit_price, ii.gst_rate, ii.line_total, p.name AS product_name
+                FROM invoice_items ii
+                JOIN products p ON ii.product_id = p.product_id
+                WHERE ii.item_id = ? AND ii.invoice_id = ?;
+            """, (item.invoice_item_id, invoice_id))
+            inv_item = cursor.fetchone()
+            if not inv_item:
+                raise HTTPException(status_code=404, detail=f"Invoice line item {item.invoice_item_id} not found in this invoice")
+
+            it_dict = dict(inv_item)
+            prior_ret = already_returned.get(item.invoice_item_id, 0)
+            max_returnable = it_dict["qty_billed"] - prior_ret
+            if item.quantity_returned > max_returnable:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Cannot return {item.quantity_returned} units for {it_dict['product_name']}. Billed: {it_dict['qty_billed']}, Prior Returned: {prior_ret}, Max returnable: {max_returnable}"
+                )
+
+            # Refund calculation proportional to line item total
+            unit_line_total = it_dict["line_total"] / it_dict["qty_billed"]
+            refund_line = round(unit_line_total * item.quantity_returned, 2)
+            total_refund_amount += refund_line
+
+            # Restock batch if restock_batch is true
+            if item.restock_batch:
+                cursor.execute("""
+                    UPDATE inventory_batches
+                    SET available_qty = available_qty + ?, status = 'Active'
+                    WHERE batch_id = ?;
+                """, (item.quantity_returned, it_dict["batch_id"]))
+
+            processed_items.append({
+                "invoice_item_id": it_dict["item_id"],
+                "batch_id": it_dict["batch_id"],
+                "product_id": it_dict["product_id"],
+                "quantity_returned": item.quantity_returned,
+                "restock_batch": 1 if item.restock_batch else 0,
+                "refund_line_total": refund_line,
+                "product_name": it_dict["product_name"]
+            })
+
+        total_refund_amount = round(total_refund_amount, 2)
+
+        # Handle refund mode
+        if return_data.refund_mode == "Khata_Credit_Adjustment":
+            if not inv_dict["customer_id"]:
+                raise HTTPException(status_code=400, detail="Cannot adjust Khata credit for a walk-in customer without a registered account")
+            cursor.execute("""
+                UPDATE customers_khata
+                SET total_credit_due = MAX(0.0, total_credit_due - ?)
+                WHERE customer_id = ?;
+            """, (total_refund_amount, inv_dict["customer_id"]))
+
+        # Generate Return / Credit Note number
+        cursor.execute("SELECT COUNT(*) FROM sales_returns;")
+        cn_num = cursor.fetchone()[0] + 1
+        return_number = f"CN-SMAK-2026-{cn_num:04d}"
+
+        # Insert return header
+        cursor.execute("""
+            INSERT INTO sales_returns (return_number, invoice_id, customer_id, refund_mode, total_refund_amount, reason, processed_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?);
+        """, (
+            return_number,
+            invoice_id,
+            inv_dict["customer_id"],
+            return_data.refund_mode,
+            total_refund_amount,
+            return_data.reason.strip(),
+            admin_user.get("full_name", "Admin")
+        ))
+        return_id = cursor.lastrowid
+
+        # Insert return items
+        for pi in processed_items:
+            cursor.execute("""
+                INSERT INTO sales_return_items (return_id, invoice_item_id, batch_id, product_id, quantity_returned, restock_batch, refund_line_total)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+            """, (
+                return_id,
+                pi["invoice_item_id"],
+                pi["batch_id"],
+                pi["product_id"],
+                pi["quantity_returned"],
+                pi["restock_batch"],
+                pi["refund_line_total"]
+            ))
+
+        # Check total returned across the invoice to set status
+        cursor.execute("""
+            SELECT SUM(qty_billed) AS total_billed FROM invoice_items WHERE invoice_id = ?;
+        """, (invoice_id,))
+        total_billed = cursor.fetchone()[0] or 0.0
+
+        cursor.execute("""
+            SELECT SUM(sri.quantity_returned) AS total_ret
+            FROM sales_return_items sri
+            JOIN sales_returns sr ON sri.return_id = sr.return_id
+            WHERE sr.invoice_id = ?;
+        """, (invoice_id,))
+        total_ret = cursor.fetchone()[0] or 0.0
+
+        new_inv_status = "Returned" if total_ret >= total_billed else "Partially_Returned"
+        cursor.execute("UPDATE invoices SET status = ? WHERE invoice_id = ?;", (new_inv_status, invoice_id))
+
+        database.log_audit(
+            conn,
+            "SALES_RETURN",
+            "sales_return",
+            return_number,
+            f"Credit Note {return_number} issued against {inv_dict['invoice_number']} - Refund: Rs {total_refund_amount:.2f} ({return_data.refund_mode}). Reason: {return_data.reason.strip()}",
+            admin_user.get("full_name", "Admin"),
+            admin_user.get("role", "Admin")
+        )
+
+        conn.commit()
+        return {
+            "success": True,
+            "return_id": return_id,
+            "return_number": return_number,
+            "invoice_id": invoice_id,
+            "invoice_number": inv_dict["invoice_number"],
+            "refund_mode": return_data.refund_mode,
+            "total_refund_amount": total_refund_amount,
+            "invoice_status": new_inv_status,
+            "items": processed_items
+        }
+    except Exception as e:
+        conn.rollback()
+        if isinstance(e, HTTPException):
+            raise e
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.get("/api/sales-returns")
+def list_sales_returns(current_user: dict = Depends(get_current_user)):
+    """Returns list of all sales returns / credit notes with items."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT sr.return_id, sr.return_number, sr.invoice_id, sr.customer_id, sr.refund_mode,
+               sr.total_refund_amount, sr.reason, sr.processed_by, sr.created_at,
+               i.invoice_number, COALESCE(c.farmer_name, 'Walk-in Customer') AS farmer_name,
+               c.phone, c.village
+        FROM sales_returns sr
+        JOIN invoices i ON sr.invoice_id = i.invoice_id
+        LEFT JOIN customers_khata c ON sr.customer_id = c.customer_id
+        ORDER BY sr.created_at DESC;
+    """)
+    returns = [dict(r) for r in cursor.fetchall()]
+
+    for ret in returns:
+        cursor.execute("""
+            SELECT sri.return_item_id, sri.quantity_returned, sri.restock_batch, sri.refund_line_total,
+                   p.name AS product_name, p.brand, b.batch_number
+            FROM sales_return_items sri
+            JOIN products p ON sri.product_id = p.product_id
+            JOIN inventory_batches b ON sri.batch_id = b.batch_id
+            WHERE sri.return_id = ?;
+        """, (ret["return_id"],))
+        ret["items"] = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+    return returns
+
+
+# =============================================================================
+# Phase 3: Enterprise Analytics & GST / CA Reports
+# =============================================================================
+
+@app.get("/api/reports/analytics")
+def get_analytics_report(admin_user: dict = Depends(require_admin)):
+    """
+    Returns enterprise-grade business intelligence metrics:
+    KPIs, 14-day sales trend, payment split, category performance, top products, and village demand.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # 1. KPIs
+    cursor.execute("SELECT COALESCE(SUM(grand_total), 0) FROM invoices WHERE date(invoice_date) = date('now') AND status != 'Returned';")
+    today_sales = float(cursor.fetchone()[0])
+
+    cursor.execute("SELECT COALESCE(SUM(grand_total), 0) FROM invoices WHERE strftime('%Y-%m', invoice_date) = strftime('%Y-%m', 'now') AND status != 'Returned';")
+    month_sales = float(cursor.fetchone()[0])
+
+    cursor.execute("SELECT COALESCE(SUM(grand_total), 0), COUNT(*) FROM invoices WHERE status != 'Returned';")
+    tot_row = cursor.fetchone()
+    total_revenue = float(tot_row[0])
+    total_invoices = int(tot_row[1])
+
+    cursor.execute("SELECT COALESCE(SUM(total_credit_due), 0) FROM customers_khata;")
+    total_outstanding_khata = float(cursor.fetchone()[0])
+
+    cursor.execute("SELECT COALESCE(SUM(available_qty * purchase_price), 0) FROM inventory_batches WHERE status = 'Active';")
+    total_inventory_valuation = float(cursor.fetchone()[0])
+
+    # Estimated Gross Profit = Sum of (line_total - (qty_billed * b.purchase_price)) on non-returned invoices
+    cursor.execute("""
+        SELECT COALESCE(SUM((ii.unit_price - b.purchase_price) * ii.qty_billed), 0)
+        FROM invoice_items ii
+        JOIN inventory_batches b ON ii.batch_id = b.batch_id
+        JOIN invoices i ON ii.invoice_id = i.invoice_id
+        WHERE i.status != 'Returned';
+    """)
+    gross_profit = float(cursor.fetchone()[0])
+
+    cursor.execute("SELECT COUNT(*) FROM customers_khata WHERE total_credit_due > 0;")
+    active_khata_farmers = int(cursor.fetchone()[0])
+
+    # 2. Daily sales trend (last 14 days)
+    cursor.execute("""
+        SELECT date(invoice_date) AS date,
+               COALESCE(SUM(grand_total), 0) AS sales,
+               COUNT(*) AS invoices_count
+        FROM invoices
+        WHERE invoice_date >= date('now', '-14 days') AND status != 'Returned'
+        GROUP BY date(invoice_date)
+        ORDER BY date ASC;
+    """)
+    daily_trend = [dict(r) for r in cursor.fetchall()]
+
+    # 3. Payment mode split
+    cursor.execute("""
+        SELECT payment_mode, COALESCE(SUM(grand_total), 0) AS total_amount, COUNT(*) AS count
+        FROM invoices
+        WHERE status != 'Returned'
+        GROUP BY payment_mode;
+    """)
+    payment_mode_split = {r["payment_mode"]: float(r["total_amount"]) for r in cursor.fetchall()}
+    for pm in ["Cash", "UPI", "Credit_Khata", "Partial_Credit"]:
+        if pm not in payment_mode_split:
+            payment_mode_split[pm] = 0.0
+
+    # 4. Category breakdown
+    cursor.execute("""
+        SELECT p.category,
+               COALESCE(SUM(ii.line_total), 0) AS total_revenue,
+               COALESCE(SUM(ii.qty_billed), 0) AS total_quantity
+        FROM invoice_items ii
+        JOIN products p ON ii.product_id = p.product_id
+        JOIN invoices i ON ii.invoice_id = i.invoice_id
+        WHERE i.status != 'Returned'
+        GROUP BY p.category
+        ORDER BY total_revenue DESC;
+    """)
+    category_breakdown = [dict(r) for r in cursor.fetchall()]
+
+    # 5. Top products by revenue
+    cursor.execute("""
+        SELECT p.product_id, p.name, p.brand, p.category,
+               COALESCE(SUM(ii.line_total), 0) AS revenue,
+               COALESCE(SUM(ii.qty_billed), 0) AS quantity_sold
+        FROM invoice_items ii
+        JOIN products p ON ii.product_id = p.product_id
+        JOIN invoices i ON ii.invoice_id = i.invoice_id
+        WHERE i.status != 'Returned'
+        GROUP BY p.product_id
+        ORDER BY revenue DESC
+        LIMIT 5;
+    """)
+    top_products = [dict(r) for r in cursor.fetchall()]
+
+    # 6. Village demand & credit
+    cursor.execute("""
+        SELECT c.village,
+               COALESCE(SUM(i.grand_total), 0) AS total_purchase,
+               COALESCE(SUM(c.total_credit_due), 0) AS village_credit_due,
+               COUNT(DISTINCT c.customer_id) AS farmer_count
+        FROM customers_khata c
+        LEFT JOIN invoices i ON c.customer_id = i.customer_id AND i.status != 'Returned'
+        GROUP BY c.village
+        ORDER BY total_purchase DESC
+        LIMIT 6;
+    """)
+    village_demand = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+
+    return {
+        "kpis": {
+            "today_sales": round(today_sales, 2),
+            "month_sales": round(month_sales, 2),
+            "total_revenue": round(total_revenue, 2),
+            "total_invoices": total_invoices,
+            "total_outstanding_khata": round(total_outstanding_khata, 2),
+            "total_inventory_valuation": round(total_inventory_valuation, 2),
+            "gross_profit": round(gross_profit, 2),
+            "active_khata_farmers": active_khata_farmers
+        },
+        "daily_sales_trend": daily_trend,
+        "payment_mode_split": payment_mode_split,
+        "category_breakdown": category_breakdown,
+        "top_products": top_products,
+        "village_demand": village_demand
+    }
+
+
+@app.get("/api/reports/gst")
+def get_gst_reports(admin_user: dict = Depends(require_admin)):
+    """
+    Returns CA-ready GSTR-1 Sales Register, HSN summary, and GST Slab totals.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    # GSTR-1 Sales Register
+    cursor.execute("""
+        SELECT i.invoice_id, i.invoice_number, i.invoice_date,
+               COALESCE(c.farmer_name, 'Walk-in Customer') AS customer_name,
+               COALESCE(c.phone, '-') AS phone,
+               '29-Karnataka' AS place_of_supply,
+               i.subtotal AS taxable_value,
+               i.total_cgst, i.total_sgst,
+               ROUND(i.total_cgst + i.total_sgst, 2) AS total_tax,
+               i.grand_total, i.payment_mode, i.status
+        FROM invoices i
+        LEFT JOIN customers_khata c ON i.customer_id = c.customer_id
+        ORDER BY i.invoice_date DESC;
+    """)
+    gstr1_register = [dict(r) for r in cursor.fetchall()]
+
+    # HSN Summary
+    cursor.execute("""
+        SELECT p.hsn_code, p.chemical_composition AS description, p.base_unit AS uqc,
+               p.gst_slab,
+               ROUND(SUM(ii.qty_billed), 2) AS total_qty,
+               ROUND(SUM(ii.qty_billed * ii.unit_price), 2) AS total_taxable_value,
+               ROUND(SUM(ii.cgst_amount), 2) AS total_cgst,
+               ROUND(SUM(ii.sgst_amount), 2) AS total_sgst,
+               ROUND(SUM(ii.cgst_amount + ii.sgst_amount), 2) AS total_tax
+        FROM invoice_items ii
+        JOIN products p ON ii.product_id = p.product_id
+        JOIN invoices i ON ii.invoice_id = i.invoice_id
+        WHERE i.status != 'Returned'
+        GROUP BY p.hsn_code, p.chemical_composition, p.base_unit, p.gst_slab
+        ORDER BY total_taxable_value DESC;
+    """)
+    hsn_summary = [dict(r) for r in cursor.fetchall()]
+
+    # Slab totals
+    cursor.execute("""
+        SELECT p.gst_slab,
+               ROUND(SUM(ii.qty_billed * ii.unit_price), 2) AS taxable_value,
+               ROUND(SUM(ii.cgst_amount), 2) AS cgst,
+               ROUND(SUM(ii.sgst_amount), 2) AS sgst,
+               ROUND(SUM(ii.cgst_amount + ii.sgst_amount), 2) AS total_tax
+        FROM invoice_items ii
+        JOIN products p ON ii.product_id = p.product_id
+        JOIN invoices i ON ii.invoice_id = i.invoice_id
+        WHERE i.status != 'Returned'
+        GROUP BY p.gst_slab
+        ORDER BY CAST(p.gst_slab AS REAL) ASC;
+    """)
+    slab_totals = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+
+    return {
+        "store": STORE_INFO,
+        "gstr1_sales_register": gstr1_register,
+        "hsn_summary": hsn_summary,
+        "slab_totals": slab_totals
+    }
+
+
+@app.get("/api/reports/export/{report_type}")
+def export_csv_report(report_type: str, admin_user: dict = Depends(require_admin)):
+    """
+    Streams UTF-8 BOM encoded CSV reports for sales, gstr1, hsn, inventory, khata_aging, and stock_adjustments.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+
+    output = io.StringIO()
+    # Write UTF-8 BOM so MS Excel renders Indian rupee and unicode symbols without corruption
+    output.write("\ufeff")
+    writer = csv.writer(output)
+
+    today_str = datetime.date.today().isoformat()
+    filename = f"SMAK_{report_type}_{today_str}.csv"
+
+    if report_type == "sales":
+        writer.writerow(["Invoice Number", "Date", "Customer", "Phone", "Payment Mode", "Taxable Value (Rs)", "CGST (Rs)", "SGST (Rs)", "Grand Total (Rs)", "Billed By", "Status"])
+        cursor.execute("""
+            SELECT i.invoice_number, i.invoice_date, COALESCE(c.farmer_name, 'Walk-in Customer'),
+                   COALESCE(c.phone, '-'), i.payment_mode, i.subtotal, i.total_cgst, i.total_sgst,
+                   i.grand_total, COALESCE(i.billed_by, '-'), i.status
+            FROM invoices i
+            LEFT JOIN customers_khata c ON i.customer_id = c.customer_id
+            ORDER BY i.invoice_date DESC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+
+    elif report_type == "gstr1":
+        writer.writerow(["GSTIN/UIN of Recipient", "Receiver Name", "Invoice Number", "Invoice Date", "Invoice Value", "Place Of Supply", "Reverse Charge", "Invoice Type", "E-Commerce GSTIN", "Rate (%)", "Taxable Value (Rs)", "Cess Amount"])
+        cursor.execute("""
+            SELECT 'URP' AS gstin, COALESCE(c.farmer_name, 'Walk-in Customer'), i.invoice_number,
+                   substr(i.invoice_date, 1, 10), i.grand_total, '29-Karnataka', 'N', 'Regular', '',
+                   p.gst_slab, ROUND(ii.qty_billed * ii.unit_price, 2), 0.00
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN invoices i ON ii.invoice_id = i.invoice_id
+            LEFT JOIN customers_khata c ON i.customer_id = c.customer_id
+            WHERE i.status != 'Returned'
+            ORDER BY i.invoice_date DESC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+
+    elif report_type == "hsn":
+        writer.writerow(["HSN Code", "Description / Chemical Composition", "UQC (Unit)", "Total Quantity", "Total Taxable Value (Rs)", "Integrated Tax (Rs)", "Central Tax / CGST (Rs)", "State Tax / SGST (Rs)", "Cess Amount (Rs)", "Total Tax (Rs)"])
+        cursor.execute("""
+            SELECT p.hsn_code, p.chemical_composition, p.base_unit,
+                   ROUND(SUM(ii.qty_billed), 2),
+                   ROUND(SUM(ii.qty_billed * ii.unit_price), 2),
+                   0.00,
+                   ROUND(SUM(ii.cgst_amount), 2),
+                   ROUND(SUM(ii.sgst_amount), 2),
+                   0.00,
+                   ROUND(SUM(ii.cgst_amount + ii.sgst_amount), 2)
+            FROM invoice_items ii
+            JOIN products p ON ii.product_id = p.product_id
+            JOIN invoices i ON ii.invoice_id = i.invoice_id
+            WHERE i.status != 'Returned'
+            GROUP BY p.hsn_code, p.chemical_composition, p.base_unit
+            ORDER BY p.hsn_code ASC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+
+    elif report_type == "inventory":
+        writer.writerow(["Barcode / SKU", "Product Name", "Brand", "Category", "Batch Number", "Mfg Date", "Expiry Date", "Available Qty", "Base Unit", "Purchase Price (Rs)", "Selling Price (Rs)", "MRP (Rs)", "Supplier", "Status"])
+        cursor.execute("""
+            SELECT COALESCE(p.barcode, '-'), p.name, p.brand, p.category, b.batch_number,
+                   b.mfg_date, b.expiry_date, b.available_qty, p.base_unit,
+                   b.purchase_price, b.selling_price, b.mrp,
+                   COALESCE(s.name, '-'), b.status
+            FROM inventory_batches b
+            JOIN products p ON b.product_id = p.product_id
+            LEFT JOIN suppliers s ON b.supplier_id = s.supplier_id
+            ORDER BY p.name ASC, b.expiry_date ASC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+
+    elif report_type == "khata_aging":
+        writer.writerow(["Farmer Name", "Phone", "Village", "Primary Crop", "Total Credit Due (Rs)", "Credit Limit (Rs)", "Credit Utilization (%)", "Account Created"])
+        cursor.execute("""
+            SELECT farmer_name, phone, village, primary_crop, total_credit_due, credit_limit,
+                   ROUND((total_credit_due / credit_limit) * 100.0, 1), created_at
+            FROM customers_khata
+            ORDER BY total_credit_due DESC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+
+    elif report_type == "stock_adjustments":
+        writer.writerow(["Adjustment ID", "Date", "Product Name", "Batch Number", "Adjustment Type", "Qty Change", "Cost Impact (Rs)", "Reason", "Performed By"])
+        cursor.execute("""
+            SELECT sa.adjustment_id, sa.created_at, p.name, b.batch_number, sa.adjustment_type,
+                   sa.quantity_change, sa.cost_impact, sa.reason, sa.performed_by
+            FROM stock_adjustments sa
+            JOIN products p ON sa.product_id = p.product_id
+            JOIN inventory_batches b ON sa.batch_id = b.batch_id
+            ORDER BY sa.created_at DESC;
+        """)
+        for row in cursor.fetchall():
+            writer.writerow(list(row))
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Invalid report type '{report_type}'. Allowed: sales, gstr1, hsn, inventory, khata_aging, stock_adjustments")
+
+    conn.close()
+    csv_bytes = output.getvalue().encode("utf-8")
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Access-Control-Expose-Headers": "Content-Disposition"
+        }
+    )
+
+
+@app.get("/api/audit-logs")
+def get_audit_logs(limit: int = 100, admin_user: dict = Depends(require_admin)):
+    """Returns recent audit logs across the ERP (Admin only)."""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT log_id, action_type, entity_type, entity_id, summary, performed_by, role, created_at
+        FROM audit_logs
+        ORDER BY log_id DESC
+        LIMIT ?;
+    """, (limit,))
+    logs = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return logs
+

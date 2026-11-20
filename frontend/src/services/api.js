@@ -128,12 +128,89 @@ export async function createInvoice(invoiceData) {
   });
 }
 
-export async function fetchInvoices() {
-  return apiFetch(`${API_BASE}/invoices`);
+export async function fetchInvoices(params = {}) {
+  const query = new URLSearchParams();
+  if (params.start_date) query.append('start_date', params.start_date);
+  if (params.end_date) query.append('end_date', params.end_date);
+  if (params.payment_mode) query.append('payment_mode', params.payment_mode);
+  if (params.status) query.append('status', params.status);
+  if (params.search) query.append('search', params.search);
+  const qs = query.toString();
+  return apiFetch(`${API_BASE}/invoices${qs ? `?${qs}` : ''}`);
 }
 
 export async function fetchInvoiceById(invoiceId) {
   return apiFetch(`${API_BASE}/invoices/${invoiceId}`);
+}
+
+// ─── Phase 3: Sales Returns (Credit Notes) ───────────────────────────────────
+
+export async function createSalesReturn(invoiceId, returnData) {
+  return apiFetch(`${API_BASE}/invoices/${invoiceId}/return`, {
+    method: 'POST',
+    body: JSON.stringify(returnData)
+  });
+}
+
+export async function fetchSalesReturns() {
+  return apiFetch(`${API_BASE}/sales-returns`);
+}
+
+// ─── Phase 3: Expiry Action Center & Stock Adjustments ────────────────────────
+
+export async function fetchInventoryAlerts() {
+  return apiFetch(`${API_BASE}/alerts/inventory`);
+}
+
+export async function adjustBatchStock(batchId, adjustmentData) {
+  return apiFetch(`${API_BASE}/batches/${batchId}/adjust`, {
+    method: 'POST',
+    body: JSON.stringify(adjustmentData)
+  });
+}
+
+export async function fetchStockAdjustments() {
+  return apiFetch(`${API_BASE}/stock-adjustments`);
+}
+
+// ─── Phase 3: Analytics & GST Reports ────────────────────────────────────────
+
+export async function fetchAnalyticsReport() {
+  return apiFetch(`${API_BASE}/reports/analytics`);
+}
+
+export async function fetchGstReports() {
+  return apiFetch(`${API_BASE}/reports/gst`);
+}
+
+export async function fetchAuditLogs(limit = 100) {
+  return apiFetch(`${API_BASE}/audit-logs?limit=${limit}`);
+}
+
+export async function downloadCsvReport(reportType) {
+  const token = getToken();
+  const headers = {};
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+  const res = await fetch(`${API_BASE}/reports/export/${reportType}`, { headers });
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => ({}));
+    throw new Error(errorData.detail || `Export failed: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="?([^";]+)"?/);
+  const filename = match ? match[1] : `SMAK_${reportType}_${new Date().toISOString().slice(0, 10)}.csv`;
+
+  const url = window.URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.URL.revokeObjectURL(url);
 }
 
 // ─── Suppliers ───────────────────────────────────────────────────────────────
@@ -150,6 +227,15 @@ export async function createSupplier(supplierData) {
 }
 
 // ─── Products / Batches ──────────────────────────────────────────────────────
+
+export async function fetchProducts(params = {}) {
+  const query = new URLSearchParams();
+  if (params.search) query.append('search', params.search);
+  if (params.category) query.append('category', params.category);
+  if (params.barcode) query.append('barcode', params.barcode);
+  const qs = query.toString();
+  return apiFetch(`${API_BASE}/products${qs ? `?${qs}` : ''}`);
+}
 
 export async function createProduct(productData) {
   return apiFetch(`${API_BASE}/products`, {

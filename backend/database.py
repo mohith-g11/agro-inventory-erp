@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS products (
     base_unit TEXT NOT NULL CHECK(base_unit IN ('Kg', 'Liter', 'Packet', 'Bottle')),
     bulk_unit TEXT NOT NULL CHECK(bulk_unit IN ('Bag', 'Quintal', 'Box', 'Drum')),
     conversion_factor REAL NOT NULL DEFAULT 1.00,
-    reorder_level REAL NOT NULL DEFAULT 10.00,
+    reorder_level INTEGER NOT NULL DEFAULT 15,
+    barcode TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -45,8 +46,11 @@ CREATE TABLE IF NOT EXISTS inventory_batches (
     mrp REAL NOT NULL,
     selling_price REAL NOT NULL,
     available_qty REAL NOT NULL DEFAULT 0.00,
+    supplier_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'Active' CHECK(status IN ('Active', 'Depleted', 'Expired_Written_Off', 'Quarantined')),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    FOREIGN KEY (supplier_id) REFERENCES suppliers(supplier_id) ON DELETE SET NULL,
     UNIQUE (product_id, batch_number),
     CHECK (expiry_date > mfg_date),
     CHECK (selling_price <= mrp AND purchase_price <= selling_price),
@@ -85,7 +89,7 @@ CREATE INDEX IF NOT EXISTS idx_customer_phone ON customers_khata (phone);
 CREATE TABLE IF NOT EXISTS invoices (
     invoice_id INTEGER PRIMARY KEY AUTOINCREMENT,
     invoice_number TEXT NOT NULL UNIQUE,
-    customer_id INTEGER NOT NULL,
+    customer_id INTEGER,
     invoice_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     subtotal REAL NOT NULL DEFAULT 0.00,
     total_cgst REAL NOT NULL DEFAULT 0.00,
@@ -95,6 +99,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     amount_paid REAL NOT NULL DEFAULT 0.00,
     balance_added_to_khata REAL NOT NULL DEFAULT 0.00,
     billed_by TEXT,
+    status TEXT NOT NULL DEFAULT 'Completed' CHECK(status IN ('Completed', 'Returned', 'Partially_Returned')),
     FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
@@ -140,27 +145,256 @@ CREATE TABLE IF NOT EXISTS users (
     is_active INTEGER DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS stock_adjustments (
+    adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    adjustment_type TEXT NOT NULL CHECK(adjustment_type IN ('Expired_WriteOff', 'Damaged', 'Return_To_Supplier', 'Audit_Increase', 'Audit_Decrease')),
+    quantity_change INTEGER NOT NULL CHECK(quantity_change != 0),
+    cost_impact REAL DEFAULT 0.0,
+    reason TEXT NOT NULL,
+    performed_by TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (batch_id) REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_stock_adj_product ON stock_adjustments (product_id);
+CREATE INDEX IF NOT EXISTS idx_stock_adj_batch ON stock_adjustments (batch_id);
+CREATE INDEX IF NOT EXISTS idx_stock_adj_created ON stock_adjustments (created_at);
+
+CREATE TABLE IF NOT EXISTS sales_returns (
+    return_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    return_number TEXT UNIQUE NOT NULL,
+    invoice_id INTEGER NOT NULL,
+    customer_id INTEGER,
+    refund_mode TEXT NOT NULL CHECK(refund_mode IN ('Cash', 'UPI', 'Khata_Credit_Adjustment')),
+    total_refund_amount REAL NOT NULL CHECK(total_refund_amount > 0),
+    reason TEXT NOT NULL,
+    processed_by TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (invoice_id) REFERENCES invoices(invoice_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE SET NULL ON UPDATE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_return_invoice ON sales_returns (invoice_id);
+CREATE INDEX IF NOT EXISTS idx_return_date ON sales_returns (created_at);
+
+CREATE TABLE IF NOT EXISTS sales_return_items (
+    return_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    return_id INTEGER NOT NULL,
+    invoice_item_id INTEGER NOT NULL,
+    batch_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    quantity_returned INTEGER NOT NULL CHECK(quantity_returned > 0),
+    restock_batch INTEGER NOT NULL DEFAULT 1 CHECK(restock_batch IN (0, 1)),
+    refund_line_total REAL NOT NULL,
+    FOREIGN KEY (return_id) REFERENCES sales_returns(return_id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (batch_id) REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+    FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action_type TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT,
+    summary TEXT NOT NULL,
+    performed_by TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs (created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs (action_type);
 """
 
 def safe_migrate(conn: sqlite3.Connection):
     """
-    Safe schema migrations:
+    Safe schema migrations across all phases:
+    Phase 2:
     - Add billed_by column to invoices if not present
     - Add recorded_by column to khata_payments if not present
+    Phase 3:
+    - Add barcode, reorder_level columns to products and populate realistic sample SKUs
+    - Add supplier_id, status columns to inventory_batches, linking to suppliers
+    - Add status column to invoices, make customer_id nullable for walk-in counter sales
+    - Create stock_adjustments, sales_returns, sales_return_items, audit_logs tables if missing
     """
     cursor = conn.cursor()
 
-    cursor.execute("PRAGMA table_info(invoices)")
-    invoice_cols = {row[1] for row in cursor.fetchall()}
-    if "billed_by" not in invoice_cols:
-        cursor.execute("ALTER TABLE invoices ADD COLUMN billed_by TEXT")
+    # 1. Products migrations
+    cursor.execute("PRAGMA table_info(products)")
+    prod_cols = {row[1]: row for row in cursor.fetchall()}
+    if "barcode" not in prod_cols:
+        cursor.execute("ALTER TABLE products ADD COLUMN barcode TEXT")
+    if "reorder_level" not in prod_cols:
+        cursor.execute("ALTER TABLE products ADD COLUMN reorder_level INTEGER DEFAULT 15")
 
+    # Populate realistic barcodes for products where barcode is null or empty
+    SAMPLE_BARCODES = {
+        1: "SMAK-IFF-1919",
+        2: "SMAK-COR-1919",
+        3: "SMAK-COR-DAP",
+        4: "SMAK-BAY-200",
+        5: "SMAK-TAT-200",
+        6: "SMAK-SYN-ACT",
+        7: "SMAK-FMC-COR",
+        8: "SMAK-SYN-AMI",
+        9: "SMAK-IFF-SAG",
+        10: "SMAK-KAV-COT",
+        11: "SMAK-IFF-1026",
+        12: "SMAK-MYS-HUM"
+    }
+    cursor.execute("SELECT product_id FROM products WHERE barcode IS NULL OR barcode = ''")
+    for (pid,) in cursor.fetchall():
+        sku = SAMPLE_BARCODES.get(pid, f"SMAK-PRD-{pid:03d}")
+        cursor.execute("UPDATE products SET barcode = ? WHERE product_id = ?", (sku, pid))
+
+    # Ensure reorder_level has default 15 if null or 0
+    cursor.execute("UPDATE products SET reorder_level = 15 WHERE reorder_level IS NULL OR reorder_level <= 0")
+
+    # 2. Inventory batches migrations
+    cursor.execute("PRAGMA table_info(inventory_batches)")
+    batch_cols = {row[1]: row for row in cursor.fetchall()}
+    if "supplier_id" not in batch_cols:
+        cursor.execute("ALTER TABLE inventory_batches ADD COLUMN supplier_id INTEGER REFERENCES suppliers(supplier_id)")
+    if "status" not in batch_cols:
+        cursor.execute("ALTER TABLE inventory_batches ADD COLUMN status TEXT DEFAULT 'Active'")
+
+    # Link unlinked batches to suppliers 1, 2, or 3
+    cursor.execute("UPDATE inventory_batches SET supplier_id = (((batch_id - 1) % 3) + 1) WHERE supplier_id IS NULL")
+    cursor.execute("UPDATE inventory_batches SET status = 'Active' WHERE status IS NULL")
+
+    # 3. Khata payments migration
     cursor.execute("PRAGMA table_info(khata_payments)")
-    payment_cols = {row[1] for row in cursor.fetchall()}
+    payment_cols = {row[1]: row for row in cursor.fetchall()}
     if "recorded_by" not in payment_cols:
         cursor.execute("ALTER TABLE khata_payments ADD COLUMN recorded_by TEXT")
 
+    # 4. Invoices migration
+    cursor.execute("PRAGMA table_info(invoices)")
+    inv_info = {row[1]: row for row in cursor.fetchall()}
+    if "billed_by" not in inv_info:
+        cursor.execute("ALTER TABLE invoices ADD COLUMN billed_by TEXT")
+    if "status" not in inv_info:
+        cursor.execute("ALTER TABLE invoices ADD COLUMN status TEXT DEFAULT 'Completed'")
+
+    # Ensure invoices table allows customer_id to be NULL for walk-in counter billing
+    if inv_info.get("customer_id") and inv_info["customer_id"][3] == 1:  # notnull == 1
+        conn.execute("PRAGMA foreign_keys = OFF;")
+        conn.execute("""
+            CREATE TABLE invoices_new (
+                invoice_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_number TEXT NOT NULL UNIQUE,
+                customer_id INTEGER,
+                invoice_date DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                subtotal REAL NOT NULL DEFAULT 0.00,
+                total_cgst REAL NOT NULL DEFAULT 0.00,
+                total_sgst REAL NOT NULL DEFAULT 0.00,
+                grand_total REAL NOT NULL DEFAULT 0.00,
+                payment_mode TEXT NOT NULL CHECK (payment_mode IN ('Cash', 'UPI', 'Credit_Khata', 'Partial_Credit')),
+                amount_paid REAL NOT NULL DEFAULT 0.00,
+                balance_added_to_khata REAL NOT NULL DEFAULT 0.00,
+                billed_by TEXT,
+                status TEXT NOT NULL DEFAULT 'Completed' CHECK(status IN ('Completed', 'Returned', 'Partially_Returned')),
+                FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE
+            );
+        """)
+        conn.execute("""
+            INSERT INTO invoices_new (invoice_id, invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata, billed_by, status)
+            SELECT invoice_id, invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata, billed_by, COALESCE(status, 'Completed')
+            FROM invoices;
+        """)
+        conn.execute("DROP TABLE invoices;")
+        conn.execute("ALTER TABLE invoices_new RENAME TO invoices;")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoice_date ON invoices (invoice_date);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_invoice_status ON invoices (status);")
+        conn.execute("PRAGMA foreign_keys = ON;")
+
+    # 5. Create new Phase 3 tables if missing
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS stock_adjustments (
+        adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        adjustment_type TEXT NOT NULL CHECK(adjustment_type IN ('Expired_WriteOff', 'Damaged', 'Return_To_Supplier', 'Audit_Increase', 'Audit_Decrease')),
+        quantity_change INTEGER NOT NULL CHECK(quantity_change != 0),
+        cost_impact REAL DEFAULT 0.0,
+        reason TEXT NOT NULL,
+        performed_by TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (batch_id) REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_adj_product ON stock_adjustments (product_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_adj_batch ON stock_adjustments (batch_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_stock_adj_created ON stock_adjustments (created_at);")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sales_returns (
+        return_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_number TEXT UNIQUE NOT NULL,
+        invoice_id INTEGER NOT NULL,
+        customer_id INTEGER,
+        refund_mode TEXT NOT NULL CHECK(refund_mode IN ('Cash', 'UPI', 'Khata_Credit_Adjustment')),
+        total_refund_amount REAL NOT NULL CHECK(total_refund_amount > 0),
+        reason TEXT NOT NULL,
+        processed_by TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (invoice_id) REFERENCES invoices(invoice_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+        FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE SET NULL ON UPDATE CASCADE
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_return_invoice ON sales_returns (invoice_id);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_return_date ON sales_returns (created_at);")
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS sales_return_items (
+        return_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        return_id INTEGER NOT NULL,
+        invoice_item_id INTEGER NOT NULL,
+        batch_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        quantity_returned INTEGER NOT NULL CHECK(quantity_returned > 0),
+        restock_batch INTEGER NOT NULL DEFAULT 1 CHECK(restock_batch IN (0, 1)),
+        refund_line_total REAL NOT NULL,
+        FOREIGN KEY (return_id) REFERENCES sales_returns(return_id) ON DELETE CASCADE ON UPDATE CASCADE,
+        FOREIGN KEY (batch_id) REFERENCES inventory_batches(batch_id) ON DELETE RESTRICT ON UPDATE CASCADE,
+        FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT ON UPDATE CASCADE
+    );
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS audit_logs (
+        log_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_type TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT,
+        summary TEXT NOT NULL,
+        performed_by TEXT NOT NULL,
+        role TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs (created_at);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs (action_type);")
+
     conn.commit()
+
+
+def log_audit(conn: sqlite3.Connection, action_type: str, entity_type: str, entity_id: str, summary: str, performed_by: str, role: str):
+    """Logs an operational action to audit_logs."""
+    try:
+        conn.execute("""
+            INSERT INTO audit_logs (action_type, entity_type, entity_id, summary, performed_by, role)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (action_type, entity_type, str(entity_id) if entity_id is not None else None, summary, performed_by, role))
+        conn.commit()
+    except Exception as e:
+        print(f"Audit log error: {e}")
 
 
 def seed_users(conn: sqlite3.Connection):
