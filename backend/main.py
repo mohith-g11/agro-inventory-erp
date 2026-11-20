@@ -14,6 +14,7 @@ import datetime
 import re
 from pathlib import Path
 from database import get_db, init_db
+from auth import get_current_user, require_admin
 
 app = FastAPI(
     title="Sri Mathurshree Agro Kendra ERP API",
@@ -99,6 +100,13 @@ class RepaymentCreate(BaseModel):
     payment_mode: str = Field(..., pattern="^(Cash|UPI|Bank_Transfer)$")
     remarks: Optional[str] = Field(None, max_length=255)
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class CreditLimitUpdate(BaseModel):
+    credit_limit: float = Field(..., ge=0)
+
 class BatchAllocation(BaseModel):
     batch_id: int
     product_name: str
@@ -145,13 +153,67 @@ class InvoiceCreate(BaseModel):
     items: List[InvoiceItemCreate]
 
 # -----------------------------------------------------------------------------
+# Auth routes: POST /api/auth/login, GET /api/auth/me
+# -----------------------------------------------------------------------------
+
+@app.post("/api/auth/login")
+def login(login_data: LoginRequest):
+    """Authenticate user with username/password, return JWT token."""
+    from auth import verify_password, create_token
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT user_id, username, full_name, password_hash, role, is_active FROM users WHERE username = ?",
+        (login_data.username,)
+    )
+    user_row = cursor.fetchone()
+    conn.close()
+
+    if not user_row:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    user = dict(user_row)
+    if not user["is_active"]:
+        raise HTTPException(status_code=401, detail="Account is inactive")
+
+    if not verify_password(login_data.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token_payload = {
+        "user_id": user["user_id"],
+        "username": user["username"],
+        "full_name": user["full_name"],
+        "role": user["role"]
+    }
+    token = create_token(token_payload)
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "full_name": user["full_name"],
+            "role": user["role"]
+        }
+    }
+
+
+@app.get("/api/auth/me")
+def get_me(current_user: dict = Depends(get_current_user)):
+    """Return current authenticated user info."""
+    return current_user
+
+
+# -----------------------------------------------------------------------------
 # 1. GET /api/dashboard-summary
 # -----------------------------------------------------------------------------
 @app.get("/api/dashboard-summary")
-def get_dashboard_summary():
+def get_dashboard_summary(current_user: dict = Depends(get_current_user)):
     """
     Returns Total Stock Value, count and list of Batches Expiring within 30 Days
     (sorted by expiry_date ASC), Low Stock items, and Total Farmer Khata Pending.
+    Staff users will have cost-related fields nulled out.
     """
     conn = get_db()
     cursor = conn.cursor()
@@ -236,10 +298,12 @@ def get_dashboard_summary():
 
     conn.close()
 
+    is_staff = current_user.get("role") == "Staff"
+
     return {
         "reference_date": datetime.date.today().isoformat(),
         "total_stock_value": stock_val["total_retail_value"],
-        "total_cost_value": stock_val["total_cost_value"],
+        "total_cost_value": None if is_staff else stock_val["total_cost_value"],
         "total_units_in_stock": stock_val["total_units_in_stock"],
         "expiring_batches_count": len(expiring_batches),
         "expiring_batches": expiring_batches,
@@ -255,9 +319,10 @@ def get_dashboard_summary():
 # 2. GET /api/inventory
 # -----------------------------------------------------------------------------
 @app.get("/api/inventory")
-def get_inventory():
+def get_inventory(current_user: dict = Depends(get_current_user)):
     """
     Returns all products joined with their active batches sorted by FEFO (expiry_date ASC).
+    Staff users will see purchase_price as null.
     """
     conn = get_db()
     cursor = conn.cursor()
@@ -314,9 +379,14 @@ def get_inventory():
             batches_by_product[pid] = []
         batches_by_product[pid].append(batch)
 
+    is_staff = current_user.get("role") == "Staff"
+
     for p in products:
         pid = p["product_id"]
         p["batches"] = batches_by_product.get(pid, [])
+        if is_staff:
+            for b in p["batches"]:
+                b["purchase_price"] = None
         p["total_stock"] = round(sum(b["available_qty"] for b in p["batches"]), 2)
         p["active_stock"] = round(sum(b["available_qty"] for b in p["batches"] if not b["is_expired"]), 2)
         p["is_low_stock"] = p["total_stock"] <= p["reorder_level"]
@@ -328,7 +398,7 @@ def get_inventory():
 # 3. GET /api/products/substitutes?composition=...
 # -----------------------------------------------------------------------------
 @app.get("/api/products/substitutes")
-def get_chemical_substitutes(composition: str = Query(..., description="Active chemical ingredient or NPK formula")):
+def get_chemical_substitutes(composition: str = Query(..., description="Active chemical ingredient or NPK formula"), current_user: dict = Depends(get_current_user)):
     """
     Searches products by chemical_composition (e.g., 'Imidacloprid 17.8% SL' or 'NPK 19:19:19')
     and returns matching substitute brands in stock with active batches.
@@ -396,7 +466,8 @@ def get_chemical_substitutes(composition: str = Query(..., description="Active c
 @app.get("/api/fefo-preview", response_model=FEFOPreviewResponse)
 def get_fefo_preview(
     product_id: int = Query(..., description="Target Product ID"),
-    qty: float = Query(..., gt=0, description="Requested billing quantity")
+    qty: float = Query(..., gt=0, description="Requested billing quantity"),
+    current_user: dict = Depends(get_current_user)
 ):
     """
     Implements the exact logic from fefo_allocation_query.sql:
@@ -552,7 +623,7 @@ def get_fefo_preview(
 # 5. GET /api/customers
 # -----------------------------------------------------------------------------
 @app.get("/api/customers")
-def get_customers():
+def get_customers(current_user: dict = Depends(get_current_user)):
     """
     Returns the seeded Farmer Khata list with villages, crops, credit limit, and dues.
     """
@@ -582,7 +653,7 @@ def get_customers():
 # 6. POST /api/invoices (ACID POS Transaction)
 # -----------------------------------------------------------------------------
 @app.post("/api/invoices")
-def create_invoice(invoice_data: InvoiceCreate):
+def create_invoice(invoice_data: InvoiceCreate, current_user: dict = Depends(get_current_user)):
     """
     Creates an official GST tax invoice:
     1. Executes FEFO batch deduction per line item
@@ -738,8 +809,8 @@ def create_invoice(invoice_data: InvoiceCreate):
         # Insert invoice header
         cursor.execute("""
             INSERT INTO invoices 
-            (invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata)
-            VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?);
+            (invoice_number, customer_id, invoice_date, subtotal, total_cgst, total_sgst, grand_total, payment_mode, amount_paid, balance_added_to_khata, billed_by)
+            VALUES (?, ?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?);
         """, (
             invoice_number,
             invoice_data.customer_id,
@@ -749,7 +820,8 @@ def create_invoice(invoice_data: InvoiceCreate):
             grand_total,
             invoice_data.payment_mode,
             amount_paid,
-            balance_khata
+            balance_khata,
+            current_user.get("full_name")
         ))
         invoice_id = cursor.lastrowid
 
@@ -785,6 +857,7 @@ def create_invoice(invoice_data: InvoiceCreate):
             "payment_mode": invoice_data.payment_mode,
             "amount_paid": amount_paid,
             "balance_added_to_khata": balance_khata,
+            "billed_by": current_user.get("full_name"),
             "items": allocated_items
         }
 
@@ -800,7 +873,7 @@ def create_invoice(invoice_data: InvoiceCreate):
 # 7. GET /api/invoices
 # -----------------------------------------------------------------------------
 @app.get("/api/invoices")
-def list_invoices():
+def list_invoices(current_user: dict = Depends(get_current_user)):
     """Returns recent invoices with customer information and items."""
     conn = get_db()
     cursor = conn.cursor()
@@ -817,6 +890,7 @@ def list_invoices():
             i.payment_mode,
             i.amount_paid,
             i.balance_added_to_khata,
+            i.billed_by,
             c.farmer_name,
             c.village,
             c.phone
@@ -917,7 +991,7 @@ def number_to_indian_rupees(amount: float) -> str:
     return f"Rupees {rupees_str}{paise_str} Only"
 
 @app.get("/api/invoices/{invoice_id}")
-def get_invoice_details(invoice_id: int):
+def get_invoice_details(invoice_id: int, current_user: dict = Depends(get_current_user)):
     """
     Returns a complete, structured GST invoice payload (returns HTTP 404 if not found).
     """
@@ -937,6 +1011,7 @@ def get_invoice_details(invoice_id: int):
             i.payment_mode,
             i.amount_paid,
             i.balance_added_to_khata,
+            i.billed_by,
             c.farmer_name,
             c.phone,
             c.village,
@@ -1034,6 +1109,7 @@ def get_invoice_details(invoice_id: int):
             "credit_amount": inv["balance_added_to_khata"],
             "amount_paid": inv["amount_paid"],
             "balance_added_to_khata": inv["balance_added_to_khata"],
+            "billed_by": inv.get("billed_by"),
             "customer": customer_info
         },
         "items": items,
@@ -1053,8 +1129,8 @@ def get_invoice_details(invoice_id: int):
 # -----------------------------------------------------------------------------
 # 8. GET /api/suppliers & POST /api/suppliers
 @app.get("/api/suppliers")
-def get_suppliers():
-    """Returns list of registered agro distributors/suppliers."""
+def get_suppliers(admin_user: dict = Depends(require_admin)):
+    """Returns list of registered agro distributors/suppliers (Admin only)."""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("""
@@ -1067,8 +1143,8 @@ def get_suppliers():
     return suppliers
 
 @app.post("/api/suppliers", status_code=201)
-def create_supplier(supplier_data: SupplierCreate):
-    """Registers a new agro supplier/distributor with unique phone and GSTIN."""
+def create_supplier(supplier_data: SupplierCreate, admin_user: dict = Depends(require_admin)):
+    """Registers a new agro supplier/distributor with unique phone and GSTIN (Admin only)."""
     name = supplier_data.name.strip()
     phone = supplier_data.phone.strip()
     gstin = supplier_data.gstin.strip().upper()
@@ -1122,7 +1198,7 @@ def create_supplier(supplier_data: SupplierCreate):
 
 # 9. GET /api/products & POST /api/products
 @app.get("/api/products")
-def list_products():
+def list_products(current_user: dict = Depends(get_current_user)):
     """Returns list of products from the catalog."""
     conn = get_db()
     cursor = conn.cursor()
@@ -1148,9 +1224,9 @@ def list_products():
     return products
 
 @app.post("/api/products", status_code=201)
-def create_product(product_data: ProductCreate):
+def create_product(product_data: ProductCreate, admin_user: dict = Depends(require_admin)):
     """
-    Adds a new product to the catalog with category, HSN code, GST slab, and unit validation.
+    Adds a new product to the catalog with category, HSN code, GST slab, and unit validation (Admin only).
     """
     name = product_data.name.strip()
     brand = product_data.brand.strip()
@@ -1240,9 +1316,9 @@ def create_product(product_data: ProductCreate):
 
 # 10. POST /api/batches
 @app.post("/api/batches", status_code=201)
-def create_batch(batch_data: BatchCreate):
+def create_batch(batch_data: BatchCreate, admin_user: dict = Depends(require_admin)):
     """
-    Adds a new batch to inventory_batches, enforcing:
+    Adds a new batch to inventory_batches (Admin only), enforcing:
     1. expiry_date > mfg_date
     2. purchase_price <= selling_price <= mrp
     3. available_qty > 0
@@ -1384,7 +1460,7 @@ def create_batch(batch_data: BatchCreate):
 
 # 11. POST /api/customers
 @app.post("/api/customers", status_code=201)
-def create_customer(customer_data: CustomerCreate):
+def create_customer(customer_data: CustomerCreate, current_user: dict = Depends(get_current_user)):
     """
     Registers a new farmer in customers_khata.
     Enforces unique phone number and non-negative credit limit.
@@ -1447,13 +1523,55 @@ def create_customer(customer_data: CustomerCreate):
     finally:
         conn.close()
 
+# 11b. PATCH /api/customers/{customer_id}/credit-limit (Admin only)
+@app.patch("/api/customers/{customer_id}/credit-limit")
+def update_farmer_credit_limit(
+    customer_id: int, 
+    limit_data: CreditLimitUpdate, 
+    admin_user: dict = Depends(require_admin)
+):
+    """
+    Updates a farmer's credit limit. Admin only.
+    """
+    if limit_data.credit_limit < 0:
+        raise HTTPException(status_code=400, detail="Credit limit must be greater than or equal to 0")
+
+    conn = get_db()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT customer_id, farmer_name, total_credit_due FROM customers_khata WHERE customer_id = ?", (customer_id,))
+        cust = cursor.fetchone()
+        if not cust:
+            raise HTTPException(status_code=404, detail=f"Farmer with customer ID {customer_id} not found")
+
+        new_limit = round(float(limit_data.credit_limit), 2)
+        cursor.execute("UPDATE customers_khata SET credit_limit = ? WHERE customer_id = ?", (new_limit, customer_id))
+        conn.commit()
+
+        cursor.execute("""
+            SELECT customer_id, farmer_name, phone, village, primary_crop, total_credit_due, credit_limit, created_at
+            FROM customers_khata WHERE customer_id = ?;
+        """, (customer_id,))
+        updated = dict(cursor.fetchone())
+        updated["available_credit"] = max(0.0, round(updated["credit_limit"] - updated["total_credit_due"], 2))
+        updated["credit_utilization_pct"] = round((updated["total_credit_due"] / updated["credit_limit"]) * 100, 1) if updated["credit_limit"] > 0 else 0.0
+        return updated
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 # 12. POST /api/customers/{customer_id}/repay
 @app.post("/api/customers/{customer_id}/repay", status_code=201)
-def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
+def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate, current_user: dict = Depends(get_current_user)):
     """
     Executes a farmer Khata debt repayment inside an atomic ACID transaction:
     1. Validates customer exists and 0 < amount <= total_credit_due
-    2. Inserts repayment record into khata_payments
+    2. Inserts repayment record into khata_payments (with recorded_by)
     3. Deducts repayment amount from customers_khata.total_credit_due
     4. Commits transaction and returns receipt details with updated balance
     """
@@ -1491,12 +1609,13 @@ def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
             )
 
         remarks = repayment_data.remarks.strip() if repayment_data.remarks else None
+        recorded_by = current_user.get("full_name")
 
         # Insert repayment record
         cursor.execute("""
-            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks)
-            VALUES (?, ?, ?, datetime('now'), ?);
-        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks))
+            INSERT INTO khata_payments (customer_id, amount, payment_mode, payment_date, remarks, recorded_by)
+            VALUES (?, ?, ?, datetime('now'), ?, ?);
+        """, (customer_id, round(amount, 2), repayment_data.payment_mode, remarks, recorded_by))
         payment_id = cursor.lastrowid
 
         # Deduct amount from customer credit due
@@ -1526,6 +1645,7 @@ def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
             "payment_mode": repayment_data.payment_mode,
             "payment_date": payment_date,
             "remarks": remarks,
+            "recorded_by": recorded_by,
             "previous_due": current_due,
             "updated_credit_due": new_due,
             "credit_limit": cust_info["credit_limit"],
@@ -1541,7 +1661,7 @@ def record_farmer_repayment(customer_id: int, repayment_data: RepaymentCreate):
 
 # 13. GET /api/customers/{customer_id}/ledger
 @app.get("/api/customers/{customer_id}/ledger")
-def get_customer_ledger(customer_id: int):
+def get_customer_ledger(customer_id: int, current_user: dict = Depends(get_current_user)):
     """
     Returns a unified reverse-chronological statement combining that farmer's
     invoices (invoices) and debt repayments (khata_payments).
@@ -1573,7 +1693,8 @@ def get_customer_ledger(customer_id: int):
             grand_total,
             payment_mode,
             amount_paid,
-            balance_added_to_khata
+            balance_added_to_khata,
+            billed_by
         FROM invoices
         WHERE customer_id = ?
         ORDER BY invoice_date DESC;
@@ -1592,7 +1713,7 @@ def get_customer_ledger(customer_id: int):
 
     # Repayments for this customer
     cursor.execute("""
-        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks
+        SELECT payment_id, customer_id, amount, payment_mode, payment_date, remarks, recorded_by
         FROM khata_payments
         WHERE customer_id = ?
         ORDER BY payment_date DESC;
@@ -1618,7 +1739,8 @@ def get_customer_ledger(customer_id: int):
             "credit": 0.0,
             "payment_mode": inv["payment_mode"],
             "items": inv["items"],
-            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter"
+            "remarks": f"Added to Khata: ₹{inv['balance_added_to_khata']:.2f}" if inv["balance_added_to_khata"] > 0 else "Fully Paid at Counter",
+            "billed_by": inv.get("billed_by")
         })
 
     total_repaid = 0.0
@@ -1636,7 +1758,8 @@ def get_customer_ledger(customer_id: int):
             "credit": pay["amount"],
             "payment_mode": pay["payment_mode"],
             "items": [],
-            "remarks": pay["remarks"] or "Counter debt repayment"
+            "remarks": pay["remarks"] or "Counter debt repayment",
+            "recorded_by": pay.get("recorded_by")
         })
 
     # Sort reverse-chronologically by date

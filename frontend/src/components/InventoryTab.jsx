@@ -28,8 +28,10 @@ export default function InventoryTab({
   onNavigateToPOS, 
   initialSearch = '',
   onRefresh,
-  onBatchAdded
+  onBatchAdded,
+  currentUser
 }) {
+  const isAdmin = currentUser?.role === 'Admin';
   const [searchTerm, setSearchTerm] = useState(initialSearch);
   const [selectedCategory, setSelectedCategory] = useState('ALL');
   const [expandedProduct, setExpandedProduct] = useState(null);
@@ -424,24 +426,26 @@ export default function InventoryTab({
           </p>
         </div>
 
-        {/* Action Buttons: New Product & Add Stock Batch */}
-        <div className="flex items-center gap-2.5 shrink-0">
-          <button
-            onClick={handleOpenNewProduct}
-            className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-white transition active:scale-95 shadow-sm inline-flex items-center gap-1.5"
-          >
-            <PackagePlus className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-            + New Product
-          </button>
+        {/* Action Buttons: New Product & Add Stock Batch — Admin only */}
+        {isAdmin && (
+          <div className="flex items-center gap-2.5 shrink-0">
+            <button
+              onClick={handleOpenNewProduct}
+              className="px-3.5 py-2 rounded-xl text-xs font-semibold bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 border border-slate-300 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 hover:text-slate-900 dark:hover:text-white transition active:scale-95 shadow-sm inline-flex items-center gap-1.5"
+            >
+              <PackagePlus className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+              + New Product
+            </button>
 
-          <button
-            onClick={() => handleOpenAddBatch()}
-            className="px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition active:scale-95 shadow-sm inline-flex items-center gap-1.5"
-          >
-            <Layers className="w-4 h-4" />
-            + Add Stock Batch
-          </button>
-        </div>
+            <button
+              onClick={() => handleOpenAddBatch()}
+              className="px-4 py-2 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition active:scale-95 shadow-sm inline-flex items-center gap-1.5"
+            >
+              <Layers className="w-4 h-4" />
+              + Add Stock Batch
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Quick Demo Test Buttons */}
@@ -673,7 +677,7 @@ export default function InventoryTab({
                                       <th className="py-1.5">Mfg Date</th>
                                       <th className="py-1.5">Expiry Date</th>
                                       <th className="py-1.5">Validity</th>
-                                      <th className="py-1.5 text-right">Cost (₹)</th>
+                                      {isAdmin && <th className="py-1.5 text-right">Cost (₹)</th>}
                                       <th className="py-1.5 text-right">MRP (₹)</th>
                                       <th className="py-1.5 text-right">Selling Price (₹)</th>
                                       <th className="py-1.5 text-right">Available Qty</th>
@@ -698,7 +702,11 @@ export default function InventoryTab({
                                             </span>
                                           )}
                                         </td>
-                                        <td className="py-1.5 text-right font-mono text-slate-500">₹{b.purchase_price.toFixed(2)}</td>
+                                          {isAdmin && (
+                                            <td className="py-1.5 text-right font-mono text-slate-500">
+                                              {b.purchase_price != null ? `₹${b.purchase_price.toFixed(2)}` : '—'}
+                                            </td>
+                                          )}
                                         <td className="py-1.5 text-right font-mono text-slate-500 line-through">₹{b.mrp.toFixed(2)}</td>
                                         <td className="py-1.5 text-right font-mono font-bold text-slate-900 dark:text-white">₹{b.selling_price.toFixed(2)}</td>
                                         <td className="py-1.5 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">

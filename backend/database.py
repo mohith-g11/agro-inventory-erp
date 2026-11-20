@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS invoices (
     payment_mode TEXT NOT NULL CHECK (payment_mode IN ('Cash', 'UPI', 'Credit_Khata', 'Partial_Credit')),
     amount_paid REAL NOT NULL DEFAULT 0.00,
     balance_added_to_khata REAL NOT NULL DEFAULT 0.00,
+    billed_by TEXT,
     FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
@@ -123,12 +124,69 @@ CREATE TABLE IF NOT EXISTS khata_payments (
     payment_mode TEXT NOT NULL CHECK(payment_mode IN ('Cash', 'UPI', 'Bank_Transfer')),
     payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     remarks TEXT,
+    recorded_by TEXT,
     FOREIGN KEY (customer_id) REFERENCES customers_khata(customer_id) ON DELETE RESTRICT ON UPDATE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_payment_customer ON khata_payments (customer_id);
 CREATE INDEX IF NOT EXISTS idx_payment_date ON khata_payments (payment_date);
+
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    full_name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('Admin', 'Staff')),
+    is_active INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
+
+def safe_migrate(conn: sqlite3.Connection):
+    """
+    Safe schema migrations:
+    - Add billed_by column to invoices if not present
+    - Add recorded_by column to khata_payments if not present
+    """
+    cursor = conn.cursor()
+
+    cursor.execute("PRAGMA table_info(invoices)")
+    invoice_cols = {row[1] for row in cursor.fetchall()}
+    if "billed_by" not in invoice_cols:
+        cursor.execute("ALTER TABLE invoices ADD COLUMN billed_by TEXT")
+
+    cursor.execute("PRAGMA table_info(khata_payments)")
+    payment_cols = {row[1] for row in cursor.fetchall()}
+    if "recorded_by" not in payment_cols:
+        cursor.execute("ALTER TABLE khata_payments ADD COLUMN recorded_by TEXT")
+
+    conn.commit()
+
+
+def seed_users(conn: sqlite3.Connection):
+    """
+    Seeds default users (Admin + Staff) if users table is empty.
+    Imports hash_password from auth module to hash passwords.
+    """
+    from auth import hash_password
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    if cursor.fetchone()[0] > 0:
+        return  # Already seeded
+
+    users = [
+        ("harish", "Harish Kumar (Proprietor)", "Admin", "admin123"),
+        ("ramesh", "Ramesh Gowda (Counter Staff)", "Staff", "staff123"),
+    ]
+    for username, full_name, role, password in users:
+        cursor.execute(
+            "INSERT INTO users (username, full_name, password_hash, role) VALUES (?, ?, ?, ?)",
+            (username, full_name, hash_password(password), role)
+        )
+    conn.commit()
+    print("Seeded default users: harish (Admin), ramesh (Staff).")
+
 
 def get_db():
     conn = sqlite3.connect(DB_FILE)
@@ -217,9 +275,11 @@ def init_db():
     conn = get_db()
     conn.executescript(SQLITE_SCHEMA)
     conn.commit()
+    safe_migrate(conn)
     parse_and_seed_data(conn)
     seed_suppliers(conn)
     seed_khata_payments(conn)
+    seed_users(conn)
     conn.close()
 
 if __name__ == "__main__":

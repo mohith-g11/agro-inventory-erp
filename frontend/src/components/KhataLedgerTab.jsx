@@ -19,12 +19,14 @@ import {
   History,
   CreditCard,
   Building,
-  Printer
+  Printer,
+  Pencil
 } from 'lucide-react';
 import { 
   createCustomer, 
   recordRepayment, 
-  fetchCustomerLedger 
+  fetchCustomerLedger,
+  updateCreditLimit
 } from '../services/api';
 
 export default function KhataLedgerTab({ 
@@ -33,8 +35,10 @@ export default function KhataLedgerTab({
   loading,
   onNavigateToPOS,
   onRefresh,
-  onPrintInvoice
+  onPrintInvoice,
+  currentUser
 }) {
+  const isAdmin = currentUser?.role === 'Admin';
   const [searchTerm, setSearchTerm] = useState('');
   const [notification, setNotification] = useState(null);
 
@@ -67,6 +71,46 @@ export default function KhataLedgerTab({
   const [ledgerData, setLedgerData] = useState(null);
   const [ledgerLoading, setLedgerLoading] = useState(false);
   const [ledgerError, setLedgerError] = useState(null);
+
+  // 4. Edit Credit Limit Modal State (Admin only)
+  const [editLimitModalOpen, setEditLimitModalOpen] = useState(false);
+  const [editingCustomer, setEditingCustomer] = useState(null);
+  const [newCreditLimit, setNewCreditLimit] = useState('');
+  const [editLimitSubmitting, setEditLimitSubmitting] = useState(false);
+  const [editLimitError, setEditLimitError] = useState(null);
+
+  const handleOpenEditLimit = (farmer) => {
+    setEditingCustomer(farmer);
+    setNewCreditLimit(String(farmer.credit_limit));
+    setEditLimitError(null);
+    setEditLimitModalOpen(true);
+  };
+
+  const handleSaveCreditLimit = async (e) => {
+    e.preventDefault();
+    if (!editingCustomer) return;
+    const limitVal = parseFloat(newCreditLimit);
+    if (isNaN(limitVal) || limitVal < 0) {
+      setEditLimitError('Credit limit must be a valid number greater than or equal to 0.');
+      return;
+    }
+    try {
+      setEditLimitSubmitting(true);
+      setEditLimitError(null);
+      await updateCreditLimit(editingCustomer.customer_id, limitVal);
+      setEditLimitModalOpen(false);
+      setNotification({
+        type: 'success',
+        title: 'Credit Limit Updated',
+        message: `Credit limit for ${editingCustomer.farmer_name} updated to ₹${limitVal.toLocaleString('en-IN')}`
+      });
+      if (onRefresh) onRefresh();
+    } catch (err) {
+      setEditLimitError(err.message || 'Failed to update credit limit');
+    } finally {
+      setEditLimitSubmitting(false);
+    }
+  };
 
   // Auto-dismiss notification after 5s
   useEffect(() => {
@@ -431,7 +475,19 @@ export default function KhataLedgerTab({
                             <span>Ledger</span>
                           </button>
 
-                          {/* 3. New Bill at Counter */}
+                          {/* 3. Edit Limit (Admin Only) */}
+                          {isAdmin && (
+                            <button
+                              onClick={() => handleOpenEditLimit(farmer)}
+                              className="bg-amber-50 dark:bg-amber-950/40 hover:bg-amber-100 dark:hover:bg-amber-900/50 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800 px-2 py-1.5 rounded-lg text-xs font-semibold transition active:scale-95 inline-flex items-center gap-1"
+                              title="Edit Credit Limit (Admin Only)"
+                            >
+                              <Pencil className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
+                              <span>Edit Limit</span>
+                            </button>
+                          )}
+
+                          {/* 4. New Bill at Counter */}
                           <button
                             onClick={() => onNavigateToPOS(null)}
                             className="bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 px-2 py-1.5 rounded-lg text-xs font-medium transition inline-flex items-center gap-1"
@@ -993,6 +1049,16 @@ export default function KhataLedgerTab({
                                   {entry.items.map(it => `${it.product_name} (${it.qty_billed})`).join(', ')}
                                 </div>
                               )}
+                              {entry.recorded_by && (
+                                <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-medium mt-0.5">
+                                  Recorded by: {entry.recorded_by}
+                                </div>
+                              )}
+                              {entry.billed_by && (
+                                <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium mt-0.5">
+                                  Billed by: {entry.billed_by}
+                                </div>
+                              )}
                             </td>
 
                             <td className="py-2.5 px-3 text-slate-500 whitespace-nowrap">
@@ -1039,6 +1105,101 @@ export default function KhataLedgerTab({
                 Close Statement
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL 4: Edit Credit Limit (Admin only)                                   */}
+      {/* ========================================================================= */}
+      {editLimitModalOpen && editingCustomer && (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-sm z-50 flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden my-auto transition-colors">
+            <div className="p-4 sm:p-5 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-amber-600 text-white flex items-center justify-center shadow-sm">
+                  <Pencil className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-slate-900 dark:text-white text-sm sm:text-base">
+                    Edit Farmer Credit Limit
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {editingCustomer.farmer_name} • {editingCustomer.village}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setEditLimitModalOpen(false)}
+                className="text-slate-400 hover:text-slate-600 dark:hover:text-white p-1 rounded-lg transition"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveCreditLimit} className="p-5 space-y-4">
+              {editLimitError && (
+                <div className="p-3 bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-800 rounded-xl text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-red-500 dark:text-red-400 shrink-0 mt-0.5" />
+                  <span>{editLimitError}</span>
+                </div>
+              )}
+
+              <div className="p-3 bg-slate-50 dark:bg-slate-950/60 rounded-xl border border-slate-200 dark:border-slate-800 space-y-1 text-xs">
+                <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                  <span>Current Outstanding Due:</span>
+                  <span className="font-mono font-bold text-slate-900 dark:text-white">
+                    ₹{editingCustomer.total_credit_due.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+                <div className="flex justify-between text-slate-600 dark:text-slate-400">
+                  <span>Current Credit Limit:</span>
+                  <span className="font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                    ₹{editingCustomer.credit_limit.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1.5">
+                  New Credit Limit (₹)
+                </label>
+                <input
+                  type="number"
+                  min="0"
+                  step="500"
+                  required
+                  value={newCreditLimit}
+                  onChange={(e) => setNewCreditLimit(e.target.value)}
+                  placeholder="e.g. 50000"
+                  className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-xl px-3.5 py-2.5 text-sm font-mono font-bold text-slate-900 dark:text-white focus:outline-none focus:border-emerald-600 transition"
+                />
+                <p className="text-[11px] text-slate-400 dark:text-slate-500 mt-1">
+                  Proprietor authorization required. Seasonal maximum credit extended for inputs.
+                </p>
+              </div>
+
+              <div className="flex items-center justify-end gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setEditLimitModalOpen(false)}
+                  className="px-4 py-2 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-lg transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={editLimitSubmitting}
+                  className="px-4 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg shadow-sm transition active:scale-95 disabled:opacity-60 flex items-center gap-1.5"
+                >
+                  {editLimitSubmitting ? (
+                    <span>Saving...</span>
+                  ) : (
+                    <span>Update Credit Limit</span>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

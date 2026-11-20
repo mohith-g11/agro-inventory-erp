@@ -6,11 +6,14 @@ import InventoryTab from './components/InventoryTab';
 import PosBillingTab from './components/PosBillingTab';
 import KhataLedgerTab from './components/KhataLedgerTab';
 import PrintableInvoiceModal from './components/PrintableInvoiceModal';
+import LoginScreen from './components/LoginScreen';
 import { 
   fetchDashboardSummary, 
   fetchInventory, 
   fetchCustomers, 
-  fetchInvoices 
+  fetchInvoices,
+  fetchCurrentUser,
+  logoutUser
 } from './services/api';
 
 export default function App() {
@@ -21,6 +24,10 @@ export default function App() {
   const [invoices, setInvoices] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+
+  // Auth state
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
   // Theme State: Default to 'light' as requested, with localStorage persistence
   const [theme, setTheme] = useState(() => {
@@ -35,6 +42,28 @@ export default function App() {
       document.documentElement.classList.remove('dark');
     }
   }, [theme]);
+
+  // On mount: verify token, listen for logout events
+  useEffect(() => {
+    const verifyAuth = async () => {
+      try {
+        const user = await fetchCurrentUser();
+        setCurrentUser(user);
+      } catch {
+        setCurrentUser(null);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+
+    verifyAuth();
+
+    const handleAgroLogout = () => {
+      setCurrentUser(null);
+    };
+    window.addEventListener('agro_logout', handleAgroLogout);
+    return () => window.removeEventListener('agro_logout', handleAgroLogout);
+  }, []);
 
   // Cross-tab interaction
   const [preSelectedProductId, setPreSelectedProductId] = useState(null);
@@ -63,9 +92,12 @@ export default function App() {
     }
   };
 
+  // Load data when user logs in
   useEffect(() => {
-    loadData();
-  }, []);
+    if (currentUser) {
+      loadData();
+    }
+  }, [currentUser]);
 
   // Quick navigation from Expiry Alert or Inventory to POS
   const handleNavigateToPOS = (productId) => {
@@ -80,6 +112,37 @@ export default function App() {
     loadData();
   };
 
+  const handleLogout = () => {
+    logoutUser();
+    setCurrentUser(null);
+  };
+
+  // ── Auth Loading Spinner ────────────────────────────────────────────────────
+  if (authLoading) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-slate-50 dark:bg-slate-950 transition-colors">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-10 h-10 border-4 border-emerald-600 border-t-transparent rounded-full animate-spin" />
+          <span className="text-sm font-medium text-slate-500 dark:text-slate-400">
+            Loading ERP...
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Login Screen ────────────────────────────────────────────────────────────
+  if (!currentUser) {
+    return (
+      <LoginScreen
+        onLoginSuccess={(user) => {
+          setCurrentUser(user);
+        }}
+      />
+    );
+  }
+
+  // ── Main ERP Layout ─────────────────────────────────────────────────────────
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors">
       {/* Sidebar Navigation */}
@@ -87,11 +150,13 @@ export default function App() {
         activeTab={activeTab} 
         setActiveTab={setActiveTab} 
         expiringCount={dashboardSummary?.expiring_batches_count || 0}
+        currentUser={currentUser}
+        onLogout={handleLogout}
       />
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col h-full overflow-hidden">
-        <Header theme={theme} setTheme={setTheme} />
+        <Header theme={theme} setTheme={setTheme} currentUser={currentUser} />
 
         <main className="flex-1 overflow-y-auto p-6 md:p-8 bg-slate-50 dark:bg-slate-950 transition-colors">
           <div className="max-w-7xl mx-auto space-y-6">
@@ -114,6 +179,7 @@ export default function App() {
                 loading={loading}
                 onNavigateToPOS={handleNavigateToPOS}
                 onNavigateToInventory={() => setActiveTab('inventory')}
+                currentUser={currentUser}
               />
             )}
 
@@ -125,6 +191,7 @@ export default function App() {
                 onNavigateToPOS={handleNavigateToPOS}
                 onRefresh={loadData}
                 onBatchAdded={loadData}
+                currentUser={currentUser}
               />
             )}
 
@@ -135,6 +202,7 @@ export default function App() {
                 customers={customers}
                 preSelectedProductId={preSelectedProductId}
                 onInvoiceCreated={handleInvoiceCreated}
+                currentUser={currentUser}
               />
             )}
 
@@ -147,6 +215,7 @@ export default function App() {
                 onNavigateToPOS={handleNavigateToPOS}
                 onRefresh={loadData}
                 onPrintInvoice={(invoiceId) => setPrintableInvoiceId(invoiceId)}
+                currentUser={currentUser}
               />
             )}
           </div>

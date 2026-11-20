@@ -425,7 +425,12 @@ export default function PrintableInvoiceModal({ invoiceId, onClose }) {
                       <div className="font-bold text-slate-900 text-xs">
                         For Sri Mathurshree Agro Kendra
                       </div>
-                      <div className="h-10"></div>
+                      {invoiceData.invoice.billed_by && (
+                        <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                          Billed by: {invoiceData.invoice.billed_by}
+                        </div>
+                      )}
+                      <div className="h-8"></div>
                       <div className="border-t border-dashed border-slate-400 w-44 pt-1 text-[11px] text-slate-600 text-center">
                         Authorized Signatory
                       </div>
@@ -560,6 +565,11 @@ export default function PrintableInvoiceModal({ invoiceId, onClose }) {
                     <div className="font-semibold">Thank you for your purchase!</div>
                     <div className="text-[9px] text-slate-600">Goods once sold cannot be returned.</div>
                     <div className="pt-2 text-[9px] font-bold">Authorized Signatory</div>
+                    {invoiceData.invoice.billed_by && (
+                      <div className="text-[8px] text-slate-500 font-mono">
+                        Billed by: {invoiceData.invoice.billed_by}
+                      </div>
+                    )}
                     <div>Sri Mathurshree Agro Kendra</div>
                   </div>
                 </div>
